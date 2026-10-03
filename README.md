@@ -14,6 +14,7 @@ alpha matte.
 | Crate | Job |
 | --- | --- |
 | `ltx-shape` | Pixel and latent shape rules, IC-LoRA token counts |
+| `ltx-budget` | GPU memory budget estimation and solver (device query, quadratic fit, cache, spatial fallback) |
 
 ## Checks
 
