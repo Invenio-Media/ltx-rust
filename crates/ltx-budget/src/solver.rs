@@ -216,10 +216,36 @@ fn best_frames_for_tile(
 ///
 /// ## Errors
 ///
+/// - [`BudgetError::InvalidConfig`] – a config field is out of range.
 /// - [`BudgetError::Shape`] – the width or height cannot be padded to 32.
 /// - [`BudgetError::NoFit`] – no shape fits the budget.
 /// - [`BudgetError::Overflow`] – a pixel-count multiply overflowed.
 pub fn solve(config: &SolveConfig<'_>) -> Result<SolveResult, BudgetError> {
+    // Validate inputs.
+    if !config.safety_margin.is_finite()
+        || config.safety_margin < 0.0
+        || config.safety_margin >= 1.0
+    {
+        return Err(BudgetError::InvalidConfig(
+            "safety_margin must be finite and in [0, 1)".into(),
+        ));
+    }
+    if !config.fps.is_finite() || config.fps <= 0.0 {
+        return Err(BudgetError::InvalidConfig(
+            "fps must be a positive finite number".into(),
+        ));
+    }
+    if config.width == 0 || config.height == 0 {
+        return Err(BudgetError::InvalidConfig(
+            "width and height must be non-zero".into(),
+        ));
+    }
+    if config.quality_cap < MIN_FRAMES {
+        return Err(BudgetError::InvalidConfig(format!(
+            "quality_cap must be at least {MIN_FRAMES}"
+        )));
+    }
+
     let nonzero_spatial =
         std::num::NonZeroU32::new(SPATIAL_MULTIPLE).ok_or(BudgetError::Overflow)?;
 
@@ -230,10 +256,13 @@ pub fn solve(config: &SolveConfig<'_>) -> Result<SolveResult, BudgetError> {
     let budget = effective_budget(config.free_bytes, config.safety_margin);
 
     // ── Full-resolution search ─────────────────────────────────────────────
+    // quality_cap is already >= MIN_FRAMES; floor_frames returns at least 1.
     let cap = floor_frames(config.quality_cap, config.scale).ok_or(BudgetError::Shape(
         ltx_shape::ShapeError::FrameCount(config.quality_cap),
     ))?;
-    let cap = if cap < MIN_FRAMES { MIN_FRAMES } else { cap };
+    // Cap is always >= 1 here; if it is below MIN_FRAMES (e.g. quality_cap=1),
+    // the full-resolution search will simply try only F=1.
+    let cap = cap.max(MIN_FRAMES);
 
     if let Some(frames) = best_frames_for_tile(config, pw, ph, budget, cap) {
         let seconds = round_seconds(f64::from(frames.saturating_sub(1)) / config.fps);
@@ -259,7 +288,8 @@ pub fn solve(config: &SolveConfig<'_>) -> Result<SolveResult, BudgetError> {
         }
 
         // Compute the matching height at the same aspect ratio, rounded to
-        // the nearest multiple of 32, clamped to [64, tw].
+        // the nearest multiple of 32.  The height is at least MIN_TILE (64 px)
+        // but is not clamped to tw; portrait results are valid.
         let th_f = (f64::from(tw) / aspect).round();
         let th_raw = f64_to_u32_round(th_f).unwrap_or(MIN_TILE);
         let th_aligned = ceil_spatial(th_raw.max(1), nonzero_spatial)

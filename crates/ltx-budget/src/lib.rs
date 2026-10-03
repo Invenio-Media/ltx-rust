@@ -58,4 +58,9 @@ pub enum BudgetError {
     /// Integer overflow in shape arithmetic.
     #[error("arithmetic overflow")]
     Overflow,
+    /// A [`SolveConfig`] field is out of range.
+    ///
+    /// [`SolveConfig`]: crate::SolveConfig
+    #[error("invalid solver configuration: {0}")]
+    InvalidConfig(String),
 }

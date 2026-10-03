@@ -11,10 +11,7 @@ fn main() {
             Ok(dev) => {
                 let free = dev.free_bytes().unwrap_or(u64::MAX);
                 let total = dev.total_bytes().unwrap_or(u64::MAX);
-                println!(
-                    "Metal device : {}",
-                    dev.device_name()
-                );
+                println!("Metal device : {}", dev.device_name());
                 println!("Total memory : {} MiB", total / (1024 * 1024));
                 println!("Free memory  : {} MiB", free / (1024 * 1024));
             }

@@ -105,7 +105,13 @@ struct Sums {
 }
 
 impl Sums {
-    fn from_samples(samples: &[(f64, u64)]) -> Self {
+    /// Builds accumulators using `t = x / x_scale` as the predictor variable.
+    ///
+    /// Normalising by the largest x reduces the condition number of the 3×3
+    /// normal-equations matrix by roughly `O(x_scale^4)`, making the Cramer
+    /// solve numerically stable for token counts up to ~2^53.
+    fn from_scaled(samples: &[(f64, u64)], x_scale: f64) -> Self {
+        let inv = 1.0 / x_scale;
         let mut n = 0.0_f64;
         let mut s1 = 0.0_f64;
         let mut s2 = 0.0_f64;
@@ -116,16 +122,17 @@ impl Sums {
         let mut s2y = 0.0_f64;
 
         for &(x, y) in samples {
+            let t = x * inv; // normalised x ∈ [0, 1]
             let yf = f64_of_u64(y);
-            let x2 = x * x;
+            let t2 = t * t;
             n += 1.0;
-            s1 += x;
-            s2 = x.mul_add(x, s2);
-            s3 = x2.mul_add(x, s3);
-            s4 = x2.mul_add(x2, s4);
+            s1 += t;
+            s2 = t.mul_add(t, s2);
+            s3 = t2.mul_add(t, s3);
+            s4 = t2.mul_add(t2, s4);
             sy += yf;
-            s1y = x.mul_add(yf, s1y);
-            s2y = x2.mul_add(yf, s2y);
+            s1y = t.mul_add(yf, s1y);
+            s2y = t2.mul_add(yf, s2y);
         }
         Self {
             n,
@@ -254,30 +261,50 @@ pub(crate) struct FitResult {
 /// - [`FitError::Singular`] – the normal-equations matrix is singular.
 pub(crate) fn fit_quadratic(samples: &[(f64, u64)]) -> Result<FitResult, FitError> {
     validate(samples, 3)?;
-    let s = Sums::from_samples(samples);
 
-    let (r, a, b) = solve3(&s).ok_or(FitError::Singular)?;
+    // Scale x to t ∈ (0, 1] to reduce the condition number of the 3×3
+    // normal-equations matrix.  Without this, sums of x⁴ at token counts
+    // around 6.5×10⁴ reach ~10²⁰, which loses ≈ 20 decimal digits in f64.
+    // validate() ensures at least one non-zero |x|, so x_scale > 0.
+    let x_scale = samples
+        .iter()
+        .map(|&(x, _)| x.abs())
+        .fold(0.0_f64, f64::max);
+    // Guard: if somehow all x are exactly 0, fall back to 1 (validate would
+    // have caught the case of fewer than 3 distinct values anyway).
+    let x_scale = if x_scale > 0.0 { x_scale } else { 1.0 };
+    let s = Sums::from_scaled(samples, x_scale);
+
+    // Coefficients in the normalised basis t = x / x_scale.
+    // Σy = r' + a'·Σt + b'·Σt² → convert back: a = a'/x_scale, b = b'/x_scale².
+    let (r, a_norm, b_norm) = solve3(&s).ok_or(FitError::Singular)?;
+    let inv = 1.0 / x_scale;
+    let a = a_norm * inv;
+    let b = b_norm * inv * inv;
 
     if b < 0.0 {
-        // Refit as linear: y = r + a·x
-        let (r2, a2) = solve2(s.n, s.s1, s.s2, s.sy, s.s1y).ok_or(FitError::Singular)?;
-        let res = residual(samples, r2, a2, 0.0);
+        // Refit as linear in the normalised basis, then convert back.
+        let (r_lin, a_lin_norm) = solve2(s.n, s.s1, s.s2, s.sy, s.s1y).ok_or(FitError::Singular)?;
+        let a_lin = a_lin_norm * inv;
+        let res = residual(samples, r_lin, a_lin, 0.0);
         return Ok(FitResult {
-            resident: r2,
-            linear: a2,
+            resident: r_lin,
+            linear: a_lin,
             quadratic: 0.0,
             residual: res,
         });
     }
 
     if a < 0.0 {
-        // Refit as quadratic-only: y = r + b·x²  (use x² as predictor)
-        let (r2, b2) = solve2(s.n, s.s2, s.s4, s.sy, s.s2y).ok_or(FitError::Singular)?;
-        let res = residual(samples, r2, 0.0, b2);
+        // Refit as quadratic-only: use normalised x² as the single predictor.
+        let (r_quad, b_quad_norm) =
+            solve2(s.n, s.s2, s.s4, s.sy, s.s2y).ok_or(FitError::Singular)?;
+        let b_quad = b_quad_norm * inv * inv;
+        let res = residual(samples, r_quad, 0.0, b_quad);
         return Ok(FitResult {
-            resident: r2,
+            resident: r_quad,
             linear: 0.0,
-            quadratic: b2,
+            quadratic: b_quad,
             residual: res,
         });
     }
@@ -300,8 +327,15 @@ pub(crate) fn fit_quadratic(samples: &[(f64, u64)]) -> Result<FitResult, FitErro
 /// See [`fit_quadratic`].
 pub(crate) fn fit_linear(samples: &[(f64, u64)]) -> Result<FitResult, FitError> {
     validate(samples, 3)?;
-    let s = Sums::from_samples(samples);
-    let (r, c) = solve2(s.n, s.s1, s.s2, s.sy, s.s1y).ok_or(FitError::Singular)?;
+    let x_scale = samples
+        .iter()
+        .map(|&(x, _)| x.abs())
+        .fold(0.0_f64, f64::max);
+    let x_scale = if x_scale > 0.0 { x_scale } else { 1.0 };
+    let s = Sums::from_scaled(samples, x_scale);
+    let inv = 1.0 / x_scale;
+    let (r, c_norm) = solve2(s.n, s.s1, s.s2, s.sy, s.s1y).ok_or(FitError::Singular)?;
+    let c = c_norm * inv;
     let res = residual(samples, r, c, 0.0);
     Ok(FitResult {
         resident: r,

@@ -4,10 +4,19 @@
 //! The free-memory estimate is:
 //! `recommendedMaxWorkingSetSize − currentAllocatedSize`.
 //!
-//! On Apple Silicon the GPU and CPU share physical RAM.
-//! `recommendedMaxWorkingSetSize` is the fraction Metal will use efficiently;
-//! `currentAllocatedSize` is what has already been handed out.
+//! ## Limitations
+//!
+//! `currentAllocatedSize` counts only the Metal allocations of the current
+//! process.  On unified memory systems other processes and the OS kernel are
+//! not reflected, so `free_bytes()` overestimates available memory when the
+//! system is under pressure.  Pass a `FixedBudget` instead if you want a
+//! conservative bound; consult `recommendedMaxWorkingSetSize` from Activity
+//! Monitor for a reasonable ceiling.
+//!
+//! Concurrent writes to the same cache path are not protected by a lock.
 
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
 
 use crate::{BudgetError, DeviceMemory};
@@ -16,8 +25,14 @@ use crate::{BudgetError, DeviceMemory};
 ///
 /// Construct with [`MetalDevice::system_default`].
 pub struct MetalDevice {
+    /// Stable human-readable device name.
     name: String,
+    /// Total recommended working-set size in bytes.
     total: u64,
+    /// Retained reference to the Metal device.  Kept alive so that
+    /// `current_allocated_size` always queries the same device, and to avoid
+    /// the overhead of a new system-default lookup on every `free_bytes` call.
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
 }
 
 impl MetalDevice {
@@ -30,17 +45,11 @@ impl MetalDevice {
             .ok_or_else(|| BudgetError::Device("no system-default Metal device".into()))?;
         let name = device.name().to_string();
         let total = device.recommendedMaxWorkingSetSize();
-        Ok(Self { name, total })
-    }
-
-    /// Returns the current byte count already allocated on the device.
-    fn current_allocated() -> Result<u64, BudgetError> {
-        let device = MTLCreateSystemDefaultDevice()
-            .ok_or_else(|| BudgetError::Device("no system-default Metal device".into()))?;
-        // currentAllocatedSize returns NSUInteger = usize on arm64.
-        let used: usize = device.currentAllocatedSize();
-        // On arm64 usize is 64-bit; TryFrom always succeeds.
-        u64::try_from(used).map_err(|e| BudgetError::Device(e.to_string()))
+        Ok(Self {
+            name,
+            total,
+            device,
+        })
     }
 }
 
@@ -50,8 +59,10 @@ impl DeviceMemory for MetalDevice {
     }
 
     fn free_bytes(&self) -> Result<u64, BudgetError> {
-        let used = Self::current_allocated()?;
-        Ok(self.total.saturating_sub(used))
+        // currentAllocatedSize returns NSUInteger = usize (64-bit on arm64).
+        let used: usize = self.device.currentAllocatedSize();
+        let used_u64 = u64::try_from(used).map_err(|e| BudgetError::Device(e.to_string()))?;
+        Ok(self.total.saturating_sub(used_u64))
     }
 
     fn total_bytes(&self) -> Result<u64, BudgetError> {

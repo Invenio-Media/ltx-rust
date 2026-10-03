@@ -148,7 +148,11 @@ impl Cache {
 
         let text = serde_json::to_string_pretty(&self.to_file())?;
 
-        // Write to a temp file in the same directory, then rename atomically.
+        // Write to a temp file in the same directory, then persist (rename)
+        // atomically.  `persist` cleans up the temp file if the rename fails,
+        // unlike a manual `keep() + rename` pair.
+        // Two concurrent writers can race here; concurrent use is a known
+        // limitation documented in the module comment.
         let mut tmp = tempfile::Builder::new()
             .suffix(".tmp")
             .tempfile_in(dir)
@@ -156,11 +160,7 @@ impl Cache {
 
         tmp.write_all(text.as_bytes())?;
         tmp.flush()?;
-
-        // `keep` + `rename` gives us an atomic replace on POSIX systems.
-        let (file, tmp_path) = tmp.keep().map_err(|e| BudgetError::Io(e.error))?;
-        drop(file);
-        std::fs::rename(&tmp_path, path)?;
+        tmp.persist(path).map_err(|e| BudgetError::Io(e.error))?;
 
         Ok(())
     }

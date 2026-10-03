@@ -11,7 +11,7 @@ description = "GPU memory budget estimation and solver for LTX-2 video generatio
 ## Query NVIDIA GPU memory via NVML.
 nvml = ["dep:nvml-wrapper"]
 ## Query Apple Silicon GPU memory via Metal (macOS only).
-metal = ["dep:objc2-metal"]
+metal = ["dep:objc2-metal", "dep:objc2"]
 
 [dependencies]
 ltx-shape = { path = "../ltx-shape" }
@@ -26,6 +26,8 @@ nvml-wrapper = { workspace = true, optional = true }
 # exception to the workspace-deps rule for this crate.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-metal = { version = "0.3.2", optional = true, features = ["MTLDevice"] }
+# objc2 provides Retained and ProtocolObject, used to store the Metal device.
+objc2 = { version = "0.6", optional = true }
 
 [lints]
 workspace = true

@@ -141,6 +141,7 @@ version = "0.1.0"
 dependencies = [
  "ltx-shape",
  "nvml-wrapper",
+ "objc2",
  "objc2-metal",
  "serde",
  "serde_json",
