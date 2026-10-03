@@ -1,0 +1,28 @@
+[package]
+name = "ltx-sampler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LTX-2.5 diffusion sampler: scheduler, patchifier, IC-LoRA conditioning, CFG guidance, and Euler loop."
+
+[dependencies]
+burn = { workspace = true, features = [] }
+ltx-shape = { path = "../ltx-shape" }
+rand.workspace = true
+rand_distr.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+burn = { workspace = true, features = ["ndarray"] }
+safetensors.workspace = true
+
+[features]
+default = []
+# GPU backends for inference — CI runs tests only on NdArray.
+metal = ["burn/metal"]
+cuda = ["burn/cuda"]
+
+[lints]
+workspace = true
