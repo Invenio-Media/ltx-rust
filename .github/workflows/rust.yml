@@ -18,7 +18,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run workspace tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   fmt:
     name: Rustfmt Check
@@ -41,4 +41,4 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (deny tier gates)
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --locked

@@ -32,6 +32,8 @@ pub enum ShapeError {
         value: u32,
         factor: u32,
     },
+    #[error("reference {height}x{width} (target / reference downscale factor) is off the VAE grid")]
+    ReferenceOffGrid { height: u32, width: u32 },
     #[error("shape arithmetic overflowed")]
     Overflow,
 }
@@ -59,12 +61,14 @@ impl Default for ScaleFactors {
     }
 }
 
-/// A clip shape in pixel space that the VAE can encode.
+/// A clip shape in pixel space that the VAE can encode. It keeps the scale
+/// factors it was validated against, so its latent grid cannot disagree with them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PixelShape {
     frames: u32,
     height: u32,
     width: u32,
+    scale: ScaleFactors,
 }
 
 impl PixelShape {
@@ -87,6 +91,7 @@ impl PixelShape {
             frames,
             height,
             width,
+            scale,
         })
     }
 
@@ -105,9 +110,15 @@ impl PixelShape {
         self.width
     }
 
+    #[must_use]
+    pub const fn scale(self) -> ScaleFactors {
+        self.scale
+    }
+
     /// The latent grid that the VAE encoder produces for this clip.
     #[must_use]
-    pub fn latent(self, scale: ScaleFactors) -> LatentShape {
+    pub fn latent(self) -> LatentShape {
+        let scale = self.scale;
         // `frames >= 1`, so the quotient is below `frames` and the `+ 1` cannot overflow.
         LatentShape {
             frames: (self.frames.saturating_sub(1) / scale.time).saturating_add(1),
@@ -246,11 +257,8 @@ impl IcLoraLayout {
     /// # Errors
     /// Returns [`ShapeError`] when the target does not divide by the downscale
     /// factor, or when the reference does not fit the VAE grid.
-    pub fn reference_pixels(
-        self,
-        target: PixelShape,
-        scale: ScaleFactors,
-    ) -> Result<PixelShape, ShapeError> {
+    pub fn reference_pixels(self, target: PixelShape) -> Result<PixelShape, ShapeError> {
+        let scale = target.scale;
         let factor = self.reference_downscale;
         if !target.height.is_multiple_of(factor.get()) {
             return Err(ShapeError::ReferenceDivisibility {
@@ -274,23 +282,21 @@ impl IcLoraLayout {
             .saturating_add(1);
         // The VAE encoder drops trailing frames that do not fit `time * k + 1`.
         let frames = floor_frames(kept, scale).ok_or(ShapeError::FrameCount(kept))?;
-        PixelShape::new(frames, target.height / factor, target.width / factor, scale)
+        let height = target.height / factor;
+        let width = target.width / factor;
+        PixelShape::new(frames, height, width, scale).map_err(|error| match error {
+            ShapeError::Spatial { .. } => ShapeError::ReferenceOffGrid { height, width },
+            other => other,
+        })
     }
 
     /// Tokens in the transformer sequence: target tokens plus reference tokens.
     ///
     /// # Errors
     /// Returns [`ShapeError`] for an invalid reference shape or an overflow.
-    pub fn sequence_tokens(
-        self,
-        target: PixelShape,
-        scale: ScaleFactors,
-    ) -> Result<SequenceTokens, ShapeError> {
-        let target_tokens = target.latent(scale).tokens()?;
-        let reference_tokens = self
-            .reference_pixels(target, scale)?
-            .latent(scale)
-            .tokens()?;
+    pub fn sequence_tokens(self, target: PixelShape) -> Result<SequenceTokens, ShapeError> {
+        let target_tokens = target.latent().tokens()?;
+        let reference_tokens = self.reference_pixels(target)?.latent().tokens()?;
         Ok(SequenceTokens {
             target: target_tokens,
             reference: reference_tokens,
@@ -362,7 +368,7 @@ mod tests {
         let height = ceil_spatial(1080, SCALE.height).unwrap();
         assert_eq!(height, 1088);
         let shape = PixelShape::new(121, height, 1920, SCALE).unwrap();
-        let latent = shape.latent(SCALE);
+        let latent = shape.latent();
         assert_eq!(
             latent,
             LatentShape {
@@ -372,7 +378,7 @@ mod tests {
             }
         );
         assert_eq!(latent.tokens_per_frame().unwrap(), 2040);
-        let seq = IcLoraLayout::FULL.sequence_tokens(shape, SCALE).unwrap();
+        let seq = IcLoraLayout::FULL.sequence_tokens(shape).unwrap();
         assert_eq!(seq.target, 32_640);
         assert_eq!(seq.total().unwrap(), 65_280);
     }
@@ -394,12 +400,12 @@ mod tests {
     fn downscaled_reference_shrinks_the_sequence() {
         let layout = IcLoraLayout::new(2, 1).unwrap();
         let target = PixelShape::new(33, 512, 768, SCALE).unwrap();
-        let reference = layout.reference_pixels(target, SCALE).unwrap();
+        let reference = layout.reference_pixels(target).unwrap();
         assert_eq!(
             (reference.height(), reference.width(), reference.frames()),
             (256, 384, 33)
         );
-        let seq = layout.sequence_tokens(target, SCALE).unwrap();
+        let seq = layout.sequence_tokens(target).unwrap();
         assert_eq!(seq.target, 5 * 16 * 24);
         assert_eq!(seq.reference, 5 * 8 * 12);
     }
@@ -410,9 +416,9 @@ mod tests {
         // encoder crops to 57 frames, which is 8 latent frames.
         let layout = IcLoraLayout::new(1, 2).unwrap();
         let target = PixelShape::new(121, 64, 64, SCALE).unwrap();
-        let reference = layout.reference_pixels(target, SCALE).unwrap();
+        let reference = layout.reference_pixels(target).unwrap();
         assert_eq!(reference.frames(), 57);
-        assert_eq!(reference.latent(SCALE).frames, 8);
+        assert_eq!(reference.latent().frames, 8);
     }
 
     #[test]
@@ -420,12 +426,26 @@ mod tests {
         let layout = IcLoraLayout::new(3, 1).unwrap();
         let target = PixelShape::new(9, 64, 96, SCALE).unwrap();
         assert!(matches!(
-            layout.reference_pixels(target, SCALE),
+            layout.reference_pixels(target),
             Err(ShapeError::ReferenceDivisibility {
                 dimension: "height",
                 ..
             })
         ));
         assert_eq!(IcLoraLayout::new(0, 1), Err(ShapeError::ReferenceScale(0)));
+    }
+
+    #[test]
+    fn reference_off_the_vae_grid_names_the_reference() {
+        // 96 / 2 = 48 divides cleanly but is not a multiple of 32.
+        let layout = IcLoraLayout::new(2, 1).unwrap();
+        let target = PixelShape::new(9, 96, 64, SCALE).unwrap();
+        assert_eq!(
+            layout.reference_pixels(target),
+            Err(ShapeError::ReferenceOffGrid {
+                height: 48,
+                width: 32
+            })
+        );
     }
 }
