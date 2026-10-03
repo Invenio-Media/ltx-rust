@@ -279,7 +279,7 @@ mod tests {
         // chunk_len=33, overlap=8, stride=25
         let (total, chunk_len, overlap) = (200_u32, 33_u32, 8_u32);
         let chunks = plan(total, chunk_len, overlap).unwrap();
-        assert!(!chunks.is_empty());
+        assert_ne!(chunks.len(), 0);
         assert_eq!(chunks.last().unwrap().end, total);
         assert_all_frames_covered(&chunks, total);
         assert_all_lengths(&chunks, chunk_len, total);
