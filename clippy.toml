@@ -1,0 +1,12 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+# Burn tensor operators run on the device and cannot overflow a Rust integer, so
+# `arithmetic_side_effects` (aimed at integer overflow) must not fire on them.
+arithmetic-side-effects-allowed = ["burn::tensor::Tensor"]
+arithmetic-side-effects-allowed-binary = [
+    ["burn::tensor::Tensor", "*"],
+    ["*", "burn::tensor::Tensor"],
+]
