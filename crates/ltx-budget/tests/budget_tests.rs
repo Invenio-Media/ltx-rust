@@ -515,12 +515,13 @@ fn calibrate_fits_dit_model() {
 #[test]
 fn calibrate_vae_fits_linear_model() {
     let resident: u64 = 500_000_000;
-    let linear_coeff: u64 = 100; // 100 bytes per pixel
+    let linear_coeff: u64 = 100; // 100 bytes per pixel-latent-frame
 
     let tile_sizes = [(256_u32, 256_u32), (512, 512), (768, 768)];
     let mut probe = |shape: PixelShape| -> Result<u64, std::convert::Infallible> {
-        let pixels = u64::from(shape.width()) * u64::from(shape.height());
-        Ok(resident.saturating_add(linear_coeff.saturating_mul(pixels)))
+        let x =
+            u64::from(shape.width()) * u64::from(shape.height()) * u64::from(shape.latent().frames);
+        Ok(resident.saturating_add(linear_coeff.saturating_mul(x)))
     };
 
     let model = calibrate_vae(9, &tile_sizes, &mut probe).expect("vae calibrate should succeed");

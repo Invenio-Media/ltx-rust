@@ -2,8 +2,8 @@
 //!
 //! The crate fits a quadratic peak-memory model for the `DiT` pass,
 //! `peak(tokens) = resident + a·tokens + b·tokens²`, and a linear model for
-//! the VAE decode pass, `peak(pixels) = resident + c·pixels`. Both use the
-//! same [`MemoryModel`] type.
+//! the VAE decode pass, `peak(pixels × latent_frames) = resident + c·x`.
+//! Both use the same [`MemoryModel`] type.
 //!
 //! Given a device memory budget, [`solve`] finds the largest `8k + 1` frame
 //! count that keeps the predicted peak below a safety margin of the free

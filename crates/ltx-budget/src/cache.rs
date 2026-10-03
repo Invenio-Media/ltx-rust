@@ -1,9 +1,9 @@
 //! JSON cache for fitted memory models.
 //!
-//! The cache is stored in a single JSON file as an array of `{key, models}`
-//! objects.  Reads are instantaneous (the file is loaded on construction).
-//! Writes are atomic: the new content is written to a temporary file in the
-//! same directory and then renamed over the target.
+//! The cache is stored in a single JSON object:
+//! `{ "entries": [{ "key": ..., "models": ... }] }`. Reads are instantaneous
+//! (the file is loaded on construction). Writes are atomic: the new content is
+//! written to a temporary file in the same directory and then persisted over the target.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -42,17 +42,17 @@ pub struct CacheKey {
 pub struct CachedModels {
     /// Quadratic `DiT` peak-memory model (x = sequence tokens).
     pub dit: MemoryModel,
-    /// Optional linear VAE peak-memory model (x = tile pixels).
+    /// Optional linear VAE peak-memory model (x = `pixels × latent_frames`).
     pub vae: Option<MemoryModel>,
     /// Raw samples used to fit the `DiT` model: `(tokens, peak_bytes)`.
     pub dit_samples: Vec<(f64, u64)>,
-    /// Raw samples used to fit the VAE model: `(pixels, peak_bytes)`.
+    /// Raw samples used to fit the VAE model: `(pixels × latent_frames, peak_bytes)`.
     pub vae_samples: Vec<(f64, u64)>,
 }
 
 // ── On-disk format ────────────────────────────────────────────────────────────
 
-/// One entry in the on-disk JSON array.
+/// One entry in the on-disk JSON object's `entries` array.
 ///
 /// Wrapping key + models in an object avoids the `serde_json` restriction that
 /// map keys must be JSON strings.

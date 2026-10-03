@@ -3,8 +3,8 @@
 //! The `DiT` model is quadratic in sequence tokens:
 //! `peak(tokens) = resident + linear·tokens + quadratic·tokens²`.
 //!
-//! The VAE model is linear in tile pixels:
-//! `peak(pixels) = resident + linear·pixels` (quadratic = 0).
+//! The VAE model is linear in tile pixel-latent-frames:
+//! `peak(pixels × latent_frames) = resident + linear·x` (quadratic = 0).
 //!
 //! Both use the same [`MemoryModel`] type; the quadratic coefficient is zero
 //! for the VAE model.  One `DiT` calibration at a fixed target resolution
@@ -24,7 +24,7 @@ use crate::fit::{self, FitResult, f64_of_u64};
 /// Parametric peak-memory model.
 ///
 /// For the `DiT` pass: `peak(tokens) = resident + linear·tokens + quadratic·tokens²`.
-/// For the VAE pass: `peak(pixels) = resident + linear·pixels` (quadratic = 0).
+/// For the VAE pass: `peak(pixels × latent_frames) = resident + linear·x` (quadratic = 0).
 ///
 /// All values are in bytes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -158,11 +158,11 @@ pub fn calibrate<E>(
 ///
 /// The probe receives different `(width, height)` tile shapes with the given
 /// `frames` and must return the measured peak GPU bytes for one VAE decode
-/// window.  At least three distinct tile sizes (distinct pixel counts) are
-/// required.
+/// window. At least three distinct `pixels × latent_frames` counts are required.
 ///
-/// The x-axis of the returned model is the tile pixel count `width × height`.
-///
+/// The x-axis of the returned model is `width × height × latent_frames`, because
+/// VAE decode activations grow with the number of latent planes when decode
+/// tiling keeps more than one plane resident.
 /// # Errors
 /// Returns [`CalibrationError`] when the probe fails, the shapes are invalid,
 /// or the least-squares fit is degenerate.
@@ -180,6 +180,7 @@ pub fn calibrate_vae<E>(
             PixelShape::new(frames, height, width, scale).map_err(CalibrationError::Shape)?;
         let pixel_count = u64::from(width)
             .checked_mul(u64::from(height))
+            .and_then(|v| v.checked_mul(u64::from(shape.latent().frames)))
             .ok_or(ShapeError::Overflow)
             .map_err(CalibrationError::Shape)?;
         let peak_bytes = probe(shape).map_err(CalibrationError::Probe)?;

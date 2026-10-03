@@ -48,7 +48,7 @@ pub const TILE_OVERLAP_PIXELS: u32 = 32;
 pub struct SolveConfig<'m> {
     /// Fitted `DiT` peak-memory model (quadratic in sequence tokens).
     pub dit: &'m MemoryModel,
-    /// Optional fitted VAE peak-memory model (linear in tile pixels).
+    /// Optional fitted VAE peak-memory model (linear in `pixels × latent_frames`).
     ///
     /// When `None`, only the `DiT` model constrains the budget.
     pub vae: Option<&'m MemoryModel>,
@@ -121,6 +121,7 @@ fn peak_bytes(config: &SolveConfig<'_>, shape: PixelShape) -> Result<f64, Budget
     let vae_peak = if let Some(vae) = config.vae {
         let pixels = u64::from(shape.width())
             .checked_mul(u64::from(shape.height()))
+            .and_then(|v| v.checked_mul(u64::from(shape.latent().frames)))
             .ok_or(BudgetError::Overflow)?;
         vae.peak(f64_of_u64(pixels))
     } else {
