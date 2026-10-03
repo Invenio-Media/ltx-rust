@@ -1,0 +1,19 @@
+[package]
+name = "ltx-backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AlphaBackend trait and Python backend for the LTX-2.5 alpha-gen pipeline."
+
+[dependencies]
+ltx-io = { path = "../ltx-io" }
+ltx-shape = { path = "../ltx-shape" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
