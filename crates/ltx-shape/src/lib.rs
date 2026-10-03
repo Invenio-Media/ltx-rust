@@ -274,7 +274,8 @@ impl IcLoraLayout {
                 factor: factor.get(),
             });
         }
-        // Frame 0, then every Nth frame of the rest. The count is at most `frames`.
+        // Upstream keeps `[0, *range(1, frames, N)]`: frame 0, then frames 1, 1 + N, ...
+        // That is `1 + ceil((frames - 1) / N)` frames, at most `frames`.
         let kept = target
             .frames
             .saturating_sub(1)
@@ -433,6 +434,10 @@ mod tests {
             (49, 4, 9),
             (9, 2, 1),
             (17, 16, 1),
+            // Upstream keeps `[0, *range(1, F, N)]`, which is `1 + ceil((F - 1) / N)`
+            // frames. A `frames[::N]` rule would give 1 for these two.
+            (65, 9, 9),
+            (121, 16, 9),
         ];
         for (frames, temporal, expected) in cases {
             let layout = IcLoraLayout::new(1, temporal).unwrap();
