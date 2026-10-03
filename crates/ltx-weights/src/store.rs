@@ -42,17 +42,38 @@ struct Entry {
 }
 
 impl Entry {
-    fn read_raw(&self, files: &[Mmap]) -> Vec<u8> {
+    fn read_raw(&self, key: &str, files: &[Mmap]) -> Result<Vec<u8>, WeightError> {
         match &self.source {
             EntrySource::Mapped {
                 file_idx,
                 start,
                 end,
             } => {
-                let file = files.get(*file_idx).map_or(&[][..], |f| f.as_ref());
-                file.get(*start..*end).unwrap_or_default().to_vec()
+                let file = files
+                    .get(*file_idx)
+                    .ok_or_else(|| WeightError::InvalidTensorData {
+                        key: key.to_owned(),
+                        message: "mapped file index is out of range".to_owned(),
+                    })?;
+                let bytes =
+                    file.get(*start..*end)
+                        .ok_or_else(|| WeightError::InvalidTensorData {
+                            key: key.to_owned(),
+                            message: "tensor byte range is outside the safetensors file".to_owned(),
+                        })?;
+                if bytes.len() != self.nbytes() {
+                    return Err(WeightError::InvalidTensorData {
+                        key: key.to_owned(),
+                        message: format!(
+                            "header expects {} bytes, range has {} bytes",
+                            self.nbytes(),
+                            bytes.len()
+                        ),
+                    });
+                }
+                Ok(bytes.to_vec())
             }
-            EntrySource::Owned(v) => v.clone(),
+            EntrySource::Owned(v) => Ok(v.clone()),
         }
     }
 
@@ -150,13 +171,18 @@ impl WeightStore {
             mmaps.push(mapped_file);
         }
 
-        // Mark FP8 scale keys as internal.
+        // Mark FP8 scale keys as internal.  A non-FP8 parameter named `foo`
+        // with a real sibling `foo_scale` must stay visible and must not be
+        // multiplied into `foo`.
         let all_keys: Vec<String> = entries.keys().cloned().collect();
         let mut scale_keys: HashSet<String> = HashSet::new();
         for k in &all_keys {
             if k.ends_with("_scale") {
                 let param_key = k.trim_end_matches("_scale");
-                if entries.contains_key(param_key) {
+                if entries
+                    .get(param_key)
+                    .is_some_and(|entry| is_fp8(entry.dtype))
+                {
                     scale_keys.insert(k.clone());
                 }
             }
@@ -211,7 +237,7 @@ impl WeightStore {
                     shape: entry.shape.clone(),
                 });
             }
-            let raw = entry.read_raw(&self.files);
+            let raw = entry.read_raw(gate_key, &self.files)?;
             let scalar = decode_scalar_f32(&raw, entry.dtype)?;
             gates.insert(gate_key.clone(), scalar);
         }
@@ -234,7 +260,8 @@ impl WeightStore {
             let raw = self
                 .entries
                 .get(&param_key)
-                .map_or_else(Vec::new, |e| e.read_raw(&self.files));
+                .ok_or_else(|| WeightError::MissingKey(param_key.clone()))?
+                .read_raw(&param_key, &self.files)?;
             let nbytes = raw.len();
 
             let mut f32_data = decode_to_f32(&raw, dtype, nbytes)?;
@@ -281,7 +308,7 @@ impl WeightStore {
                 (
                     entry.shape.clone(),
                     entry.dtype,
-                    entry.read_raw(&self.files),
+                    entry.read_raw(&qkv_key, &self.files)?,
                 )
             };
 
@@ -295,7 +322,17 @@ impl WeightStore {
             let d = leading / 3;
 
             let nbytes = raw.len();
-            let f32_data = decode_to_f32(&raw, dtype, nbytes)?;
+            let mut f32_data = decode_to_f32(&raw, dtype, nbytes)?;
+            if is_fp8(dtype) {
+                let scale_key = format!("{qkv_key}_scale");
+                if let Some(scale_entry) = self.entries.get(&scale_key) {
+                    let scale_raw = scale_entry.read_raw(&scale_key, &self.files)?;
+                    let scale = decode_scalar_f32(&scale_raw, scale_entry.dtype)?;
+                    for value in &mut f32_data {
+                        *value = scale.mul_add(*value, 0.0_f32);
+                    }
+                }
+            }
             let elem_per_split = f32_data.len() / 3;
 
             let is_weight = qkv_key.ends_with(".weight");
@@ -337,6 +374,9 @@ impl WeightStore {
             }
 
             self.entries.remove(&qkv_key);
+            let scale_key = format!("{qkv_key}_scale");
+            self.entries.remove(&scale_key);
+            self.scale_keys.remove(&scale_key);
         }
 
         Ok(())
@@ -437,7 +477,7 @@ impl WeightStore {
         let shape = entry.shape.clone();
         let dtype = entry.dtype;
         let nbytes = entry.nbytes();
-        let raw = entry.read_raw(&self.files);
+        let raw = entry.read_raw(key, &self.files)?;
 
         let mut f32_data = decode_to_f32(&raw, dtype, nbytes).map_err(|e| match e {
             WeightError::UnsupportedDtype { dtype: d, .. } => WeightError::UnsupportedDtype {
@@ -449,8 +489,10 @@ impl WeightStore {
 
         // Apply per-tensor FP8 scale if present.
         let scale_key = format!("{key}_scale");
-        if let Some(scale_entry) = self.entries.get(&scale_key) {
-            let scale_raw = scale_entry.read_raw(&self.files);
+        if is_fp8(dtype)
+            && let Some(scale_entry) = self.entries.get(&scale_key)
+        {
+            let scale_raw = scale_entry.read_raw(&scale_key, &self.files)?;
             let scale = decode_scalar_f32(&scale_raw, scale_entry.dtype)?;
             for v in &mut f32_data {
                 *v = scale.mul_add(*v, 0.0_f32);
@@ -458,9 +500,10 @@ impl WeightStore {
         }
 
         // Apply cached LoRA delta.
-        if let Some(delta) = self.lora_deltas.get(key)
-            && delta.len() == f32_data.len()
-        {
+        if let Some(delta) = self.lora_deltas.get(key) {
+            if delta.len() != f32_data.len() {
+                return Err(WeightError::LoraShapeMismatch(key.to_owned()));
+            }
             for (v, d) in f32_data.iter_mut().zip(delta.iter()) {
                 *v += *d;
             }
@@ -599,6 +642,10 @@ const fn dtype_elem_size(dtype: SfDtype) -> usize {
         // F32/I32/U32 and any future dtypes default to 4.
         _ => 4,
     }
+}
+/// Whether `dtype` is one of the FP8 formats that uses a sibling scale tensor.
+const fn is_fp8(dtype: SfDtype) -> bool {
+    matches!(dtype, SfDtype::F8_E4M3 | SfDtype::F8_E5M2)
 }
 
 /// Decode raw bytes to `Vec<f32>`.

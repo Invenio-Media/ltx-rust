@@ -282,6 +282,40 @@ fn video_decoder_qkv_split() {
     assert_eq!(v.data, [8.0f32, 9.0, 10.0, 11.0]);
 }
 
+#[test]
+fn qkv_split_applies_fp8_scale_before_splitting() {
+    // e4m3 1.0, 2.0, 3.0 split into q/k/v and scaled by 4.
+    let qkv = [0x38u8, 0x40u8, 0x44u8];
+    let scale_bytes = f32_bytes(&[4.0]);
+    let sft = make_safetensors(
+        None,
+        &[
+            (
+                "vae.decoder.blocks.0.attn.qkv.weight",
+                &[3, 1],
+                "F8_E4M3",
+                &qkv,
+            ),
+            (
+                "vae.decoder.blocks.0.attn.qkv.weight_scale",
+                &[1],
+                "F32",
+                &scale_bytes,
+            ),
+        ],
+    );
+    let (_tmp, path) = write_tmp(&sft);
+
+    let store = WeightStore::open(&[&path], &KeyMap::video_decoder()).unwrap();
+    assert!(!store.contains("blocks.0.attn.qkv.weight_scale"));
+    assert_eq!(store.read("blocks.0.attn.to_q.weight").unwrap().data, [4.0]);
+    assert_eq!(store.read("blocks.0.attn.to_k.weight").unwrap().data, [8.0]);
+    assert_eq!(
+        store.read("blocks.0.attn.to_v.weight").unwrap().data,
+        [12.0]
+    );
+}
+
 // ─── Gate fold test ────────────────────────────────────────────────────────────
 
 #[test]
@@ -372,6 +406,25 @@ fn fp8_e4m3fn_with_scale() {
     );
 }
 
+#[test]
+fn non_fp8_scale_sibling_is_visible_and_not_applied() {
+    let weight_bytes = f32_bytes(&[2.0]);
+    let scale_bytes = f32_bytes(&[100.0]);
+    let sft = make_safetensors(
+        None,
+        &[
+            ("w", &[1], "F32", &weight_bytes),
+            ("w_scale", &[1], "F32", &scale_bytes),
+        ],
+    );
+    let (_tmp, path) = write_tmp(&sft);
+
+    let store = WeightStore::open(&[&path], &KeyMap::identity()).unwrap();
+    assert!(store.contains("w_scale"));
+    assert_eq!(store.read("w").unwrap().data, [2.0]);
+    assert_eq!(store.read("w_scale").unwrap().data, [100.0]);
+}
+
 // ─── LoRA merge tests ─────────────────────────────────────────────────────────
 
 #[test]
@@ -404,7 +457,7 @@ fn lora_merge_basic() {
     let report = store.merge_lora(&lora, 1.0).unwrap();
 
     assert_eq!(report.matched_keys, ["layer.weight"]);
-    assert!(report.unmatched_lora_keys.is_empty());
+    assert_eq!(report.unmatched_lora_keys, Vec::<String>::new());
 
     let ht = store.read("layer.weight").unwrap();
     // delta = B @ A = [[3*1+4*2]] wait...

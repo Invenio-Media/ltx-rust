@@ -37,6 +37,15 @@ pub enum WeightError {
         dtype: String,
     },
 
+    /// The tensor's byte range or byte length does not match its header.
+    #[error("invalid tensor data for key {key:?}: {message}")]
+    InvalidTensorData {
+        /// The key whose data is invalid.
+        key: String,
+        /// What was wrong with the bytes.
+        message: String,
+    },
+
     /// Two safetensors files both define the same post-rename key.
     #[error("duplicate key {0:?} across checkpoint files")]
     DuplicateKey(String),
