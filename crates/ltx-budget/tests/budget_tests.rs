@@ -554,6 +554,10 @@ fn sample_key(suffix: &str) -> CacheKey {
         offload_mode: "none".into(),
         backend_id: "burn-ndarray".into(),
         model_id: "test-model-v1".into(),
+        calibration_width: 1920,
+        calibration_height: 1088,
+        reference_downscale: 1,
+        reference_temporal: 1,
     }
 }
 
@@ -573,6 +577,7 @@ fn sample_models() -> CachedModels {
         }),
         dit_samples: vec![(10_000.0, 1_100_000_000), (50_000.0, 1_200_000_000)],
         vae_samples: vec![(100_000.0, 510_000_000), (500_000.0, 550_000_000)],
+        vae_calibration_frames: Some(121),
     }
 }
 

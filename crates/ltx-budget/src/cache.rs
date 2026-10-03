@@ -33,6 +33,16 @@ pub struct CacheKey {
     pub backend_id: String,
     /// Model identifier (e.g. a safetensors hash or a model tag).
     pub model_id: String,
+    /// Padded width used for calibration, or 0 when a token-only model is reused
+    /// across resolutions. Include this in cache keys when the fitted model or
+    /// backend memory allocator is resolution-sensitive.
+    pub calibration_width: u32,
+    /// Padded height used for calibration, or 0 when resolution-independent.
+    pub calibration_height: u32,
+    /// `IC-LoRA` reference downscale factor used during calibration.
+    pub reference_downscale: u32,
+    /// `IC-LoRA` reference temporal factor used during calibration.
+    pub reference_temporal: u32,
 }
 
 // ── CachedModels ─────────────────────────────────────────────────────────────
@@ -48,6 +58,12 @@ pub struct CachedModels {
     pub dit_samples: Vec<(f64, u64)>,
     /// Raw samples used to fit the VAE model: `(pixels × latent_frames, peak_bytes)`.
     pub vae_samples: Vec<(f64, u64)>,
+    /// Frame count used when calibrating the VAE model.
+    ///
+    /// `calibrate_vae` should be run at the maximum decode window length that
+    /// the solver will use; otherwise the model extrapolates over latent-frame
+    /// count.
+    pub vae_calibration_frames: Option<u32>,
 }
 
 // ── On-disk format ────────────────────────────────────────────────────────────
