@@ -1,0 +1,15 @@
+[package]
+name = "ltx-chunk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Temporal and spatial chunk planning, reflection padding, and blend weighting for the LTX-2 pipeline."
+
+[dependencies]
+ltx-shape = { path = "../ltx-shape" }
+thiserror.workspace = true
+
+[lints]
+workspace = true
