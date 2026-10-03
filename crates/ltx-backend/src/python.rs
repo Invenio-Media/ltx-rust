@@ -349,9 +349,12 @@ impl AlphaBackend for PythonBackend {
 
 impl Drop for PythonBackend {
     fn drop(&mut self) {
-        // Dropping inner closes stdin (BufWriter flushes on drop), which signals
-        // the runner to exit.  Then wait for the process so it is not orphaned.
+        // The runner is long-lived and blocks on stdin.  `Inner` still owns the
+        // stdin pipe while we are inside `drop`, so waiting first can deadlock.
+        // Kill is safe here: all requested work has already completed before a
+        // `PythonBackend` is dropped.
         if let Ok(mut inner) = self.inner.lock() {
+            let _ = inner.child.kill();
             let _ = inner.child.wait();
         }
     }
