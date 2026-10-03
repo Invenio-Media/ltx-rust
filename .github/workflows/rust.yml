@@ -20,6 +20,16 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
+  msrv:
+    name: MSRV (1.92)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+      - name: Check on the minimum supported Rust version
+        run: cargo check --workspace --all-targets --locked
+
   fmt:
     name: Rustfmt Check
     runs-on: blacksmith-2vcpu-ubuntu-2404

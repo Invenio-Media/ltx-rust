@@ -422,6 +422,27 @@ mod tests {
     }
 
     #[test]
+    fn reference_frames_match_the_python_reference() {
+        // (target frames, temporal factor, encoded reference frames). Generated with
+        // `ltx_pipelines.iclora_utils.temporal_subsample` followed by the encoder's
+        // 8k + 1 crop, at LTX-2 commit 9ec55f9.
+        let cases = [
+            (33, 3, 9),
+            (121, 7, 17),
+            (97, 5, 17),
+            (49, 4, 9),
+            (9, 2, 1),
+            (17, 16, 1),
+        ];
+        for (frames, temporal, expected) in cases {
+            let layout = IcLoraLayout::new(1, temporal).unwrap();
+            let target = PixelShape::new(frames, 32, 32, SCALE).unwrap();
+            let reference = layout.reference_pixels(target).unwrap();
+            assert_eq!(reference.frames(), expected, "F={frames} N={temporal}");
+        }
+    }
+
+    #[test]
     fn reference_downscale_must_divide_the_target() {
         let layout = IcLoraLayout::new(3, 1).unwrap();
         let target = PixelShape::new(9, 64, 96, SCALE).unwrap();

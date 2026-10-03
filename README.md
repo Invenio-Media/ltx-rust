@@ -19,6 +19,6 @@ alpha matte.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked
+cargo test --workspace --locked
 ```
