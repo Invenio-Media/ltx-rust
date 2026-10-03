@@ -127,14 +127,13 @@ impl WeightStore {
 
         for (file_idx, path) in paths.iter().enumerate() {
             let file = std::fs::File::open(path.as_ref())?;
+            // SAFETY: the mmap is read-only and kept alive in `self.files`.
+            // Callers must not truncate or modify the safetensors file while
+            // a `WeightStore` that maps it is alive.
             let mapped_file = unsafe { Mmap::map(&file) }?;
 
             let bytes: &[u8] = mapped_file.as_ref();
-            // Extend lifetime for read_metadata; mmap is pinned in mmaps.
-            let bytes_static: &'static [u8] =
-                unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
-
-            let (header_len, metadata_obj) = SafeTensors::read_metadata(bytes_static)?;
+            let (header_len, metadata_obj) = SafeTensors::read_metadata(bytes)?;
             let data_start: usize = 8_usize.saturating_add(header_len);
 
             // Merge __metadata__ (first file wins on collision).

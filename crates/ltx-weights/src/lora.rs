@@ -56,13 +56,13 @@ impl LoraFile {
     /// Returns [`WeightError::Io`] or [`WeightError::Safetensors`] on failure.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WeightError> {
         let file = std::fs::File::open(path.as_ref())?;
+        // SAFETY: the mmap is read-only and kept alive in `self.mmap`.
+        // Callers must not truncate or modify the safetensors file while a
+        // `LoraFile` that maps it is alive.
         let mmap = unsafe { Mmap::map(&file) }?;
 
         let bytes: &[u8] = mmap.as_ref();
-        let bytes_static: &'static [u8] =
-            unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
-
-        let (header_len, meta_obj) = SafeTensors::read_metadata(bytes_static)?;
+        let (header_len, meta_obj) = SafeTensors::read_metadata(bytes)?;
         let data_start = 8_usize.saturating_add(header_len);
 
         let metadata: HashMap<String, String> = meta_obj.metadata().clone().unwrap_or_default();
