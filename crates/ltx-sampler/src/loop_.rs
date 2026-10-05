@@ -84,6 +84,10 @@ fn euler_step<B: Backend>(
 ///
 /// # Errors
 /// - [`SamplerError::EmptySchedule`] when `sigmas.len() < 2`.
+/// - [`SamplerError::InvalidSigma`] when a current step sigma is not finite or
+///   is not positive, or when the next sigma is not finite or is negative.
+/// - [`SamplerError::TargetTokensTooLarge`] when `target_token_count` exceeds
+///   the state's token count.
 /// - [`SamplerError::Overflow`] for index arithmetic overflows.
 /// - Propagates model errors.
 pub fn euler_denoising_loop<B, M>(
@@ -119,6 +123,19 @@ where
                 len: sigmas.len(),
             })?;
 
+        if !sigma.is_finite() || sigma <= 0.0_f32 {
+            return Err(SamplerError::InvalidSigma {
+                step: step_idx,
+                sigma,
+            });
+        }
+        if !sigma_next.is_finite() || sigma_next < 0.0_f32 {
+            return Err(SamplerError::InvalidSigma {
+                step: next_idx,
+                sigma: sigma_next,
+            });
+        }
+
         let x0 = denoiser.apply(model, &state, sigma, device)?;
         let x0_adj = post_process(x0, &state.denoise_mask, &state.clean_latent);
         let new_latent = euler_step(state.latent, x0_adj, sigma, sigma_next);
@@ -128,7 +145,7 @@ where
         };
     }
 
-    Ok(clear_conditioning(state, target_token_count))
+    clear_conditioning(state, target_token_count)
 }
 
 // ---------------------------------------------------------------------------
@@ -138,12 +155,24 @@ where
 /// Keep only the first `target_token_count` tokens, dropping conditioning.
 ///
 /// Mirrors `VideoLatentTools.clear_conditioning` in the reference.
+///
+/// # Errors
+/// Returns [`SamplerError::TargetTokensTooLarge`] when `target_token_count`
+/// exceeds the state's token count.
 pub fn clear_conditioning<B: Backend>(
     state: LatentState<B>,
     target_token_count: usize,
-) -> LatentState<B> {
+) -> Result<LatentState<B>, SamplerError> {
+    let [_batch, available_tokens, _channels] = state.latent.dims();
+    if target_token_count > available_tokens {
+        return Err(SamplerError::TargetTokensTooLarge {
+            target: target_token_count,
+            available: available_tokens,
+        });
+    }
+
     let tgt = target_token_count;
-    LatentState {
+    Ok(LatentState {
         latent: state.latent.narrow(1, 0, tgt),
         denoise_mask: state.denoise_mask.narrow(1, 0, tgt),
         positions: state.positions.narrow(2, 0, tgt),
@@ -152,7 +181,7 @@ pub fn clear_conditioning<B: Backend>(
             .attention_mask
             .map(|mask| mask.narrow(1, 0, tgt).narrow(2, 0, tgt)),
         keyframes_mask: state.keyframes_mask.map(|km| km.narrow(1, 0, tgt)),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -238,7 +267,7 @@ mod tests {
             attention_mask: None,
             keyframes_mask: None,
         };
-        let stripped = clear_conditioning(state, 4);
+        let stripped = clear_conditioning(state, 4).unwrap();
         assert_eq!(stripped.latent.dims(), [1, 4, 2]);
         assert_eq!(stripped.positions.dims(), [1, 3, 4, 2]);
     }
@@ -262,6 +291,46 @@ mod tests {
             &device,
         );
         assert!(matches!(result, Err(SamplerError::EmptySchedule(_))));
+    }
+
+    #[test]
+    fn zero_sigma_before_final_step_errors() {
+        let device = dev();
+        let sigmas = [0.5_f32, 0.0, 0.0];
+        let ctx = Tensor::<B, 3>::zeros([1, 1, 4], &device);
+        let denoiser = GuidedDenoiser::<B> {
+            context: ctx,
+            negative_context: None,
+            params: GuiderParams::alpha_gen(1.0),
+        };
+        let result = euler_denoising_loop(
+            &sigmas,
+            simple_state(device),
+            4,
+            &ZeroModel,
+            &denoiser,
+            &device,
+        );
+        assert!(matches!(
+            result,
+            Err(SamplerError::InvalidSigma {
+                step: 1,
+                sigma: 0.0
+            })
+        ));
+    }
+
+    #[test]
+    fn clear_conditioning_rejects_too_many_tokens() {
+        let device = dev();
+        let result = clear_conditioning(simple_state(device), 5);
+        assert!(matches!(
+            result,
+            Err(SamplerError::TargetTokensTooLarge {
+                target: 5,
+                available: 4
+            })
+        ));
     }
 
     #[test]

@@ -17,6 +17,14 @@ pub enum SamplerError {
     #[error("step index {step} is out of bounds for schedule length {len}")]
     ScheduleIndexOutOfBounds { step: usize, len: usize },
 
+    /// A sigma value is invalid for an Euler step.
+    #[error("sigma at step {step} must be finite and positive for current step, got {sigma}")]
+    InvalidSigma { step: usize, sigma: f32 },
+
+    /// The caller requested more target tokens than the state contains.
+    #[error("target token count {target} exceeds available tokens {available}")]
+    TargetTokensTooLarge { target: usize, available: usize },
+
     /// CFG scale != 1 but no negative context was provided.
     #[error("cfg_scale != 1.0 requires a negative context tensor")]
     MissingNegativeContext,
