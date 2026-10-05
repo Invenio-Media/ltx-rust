@@ -59,7 +59,7 @@
 //! for the lifetime of the process.  See `python/alphagen_runner.py` for
 //! details.
 
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -122,6 +122,31 @@ struct Inner {
     stdout: BufReader<ChildStdout>,
 }
 
+fn stderr_tail_text(stderr_tail: &Arc<Mutex<Vec<String>>>) -> String {
+    stderr_tail
+        .lock()
+        .map(|lines| lines.join("\n"))
+        .unwrap_or_default()
+}
+
+fn runner_exited(stderr_tail: &Arc<Mutex<Vec<String>>>) -> BackendError {
+    BackendError::RunnerError {
+        msg: "runner exited".into(),
+        stderr: stderr_tail_text(stderr_tail),
+    }
+}
+
+fn map_runner_write_error(
+    err: std::io::Error,
+    stderr_tail: &Arc<Mutex<Vec<String>>>,
+) -> BackendError {
+    if err.kind() == ErrorKind::BrokenPipe {
+        runner_exited(stderr_tail)
+    } else {
+        BackendError::Io(err)
+    }
+}
+
 impl Inner {
     fn round_trip(
         &mut self,
@@ -129,22 +154,28 @@ impl Inner {
         stderr_tail: &Arc<Mutex<Vec<String>>>,
     ) -> Result<Response, BackendError> {
         let line = serde_json::to_string(req)?;
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
+        self.stdin
+            .write_all(line.as_bytes())
+            .map_err(|e| map_runner_write_error(e, stderr_tail))?;
+        self.stdin
+            .write_all(b"\n")
+            .map_err(|e| map_runner_write_error(e, stderr_tail))?;
+        self.stdin
+            .flush()
+            .map_err(|e| map_runner_write_error(e, stderr_tail))?;
 
         let mut resp_line = String::new();
-        self.stdout.read_line(&mut resp_line)?;
+        let bytes = self.stdout.read_line(&mut resp_line)?;
+        if bytes == 0 {
+            return Err(runner_exited(stderr_tail));
+        }
 
         let resp: Response = serde_json::from_str(resp_line.trim_end())?;
         if resp.ok {
             Ok(resp)
         } else {
             let msg = resp.error.unwrap_or_else(|| "unknown runner error".into());
-            let stderr = stderr_tail
-                .lock()
-                .map(|lines| lines.join("\n"))
-                .unwrap_or_default();
+            let stderr = stderr_tail_text(stderr_tail);
             Err(BackendError::RunnerError { msg, stderr })
         }
     }
@@ -303,12 +334,17 @@ impl AlphaBackend for PythonBackend {
         Ok(MemSample { peak_bytes })
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "run_chunk uses fixed exchange-file paths; the runner mutex must cover write, request, and read"
+    )]
     fn run_chunk(
         &self,
         rgb: &VideoChunk,
         seed: u64,
         cond: Option<&Keyframes>,
     ) -> Result<AlphaChunk, BackendError> {
+        let mut inner = self.lock()?;
         let tmp = self.tmp.path();
 
         let rgb_path = Self::write_rgb_bin(tmp, rgb)?;
@@ -342,7 +378,7 @@ impl AlphaBackend for PythonBackend {
             keyframes_path: kf_path_str,
         };
 
-        self.lock()?.round_trip(&req, &self.stderr_tail)?;
+        inner.round_trip(&req, &self.stderr_tail)?;
         Self::read_alpha_bin(&alpha_out, rgb)
     }
 }

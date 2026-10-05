@@ -58,6 +58,10 @@ pub enum IoError {
     #[error("empty frame range {start}..{end}")]
     EmptyRange { start: u32, end: u32 },
 
+    /// `ffmpeg` ended before the requested exclusive end frame.
+    #[error("ffmpeg ended at frame {index} before requested end frame {end_frame}")]
+    ShortFrameStream { index: u32, end_frame: u32 },
+
     /// Data length does not match expected dimensions.
     #[error("data length {got} != expected {expected}")]
     DataLengthMismatch { expected: usize, got: usize },

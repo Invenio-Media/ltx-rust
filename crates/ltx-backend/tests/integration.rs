@@ -89,6 +89,58 @@ while True:
         print(json.dumps({"ok": False, "error": f"unknown cmd: {cmd}"}), flush=True)
 "#;
 
+const SLOW_PROTOCOL_DOUBLE: &str = r#"#!/usr/bin/env python3
+import json
+import struct
+import sys
+import time
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    req = json.loads(line)
+    if req.get("cmd") == "run":
+        time.sleep(0.2)
+        rgb_path = req["rgb_path"]
+        alpha_out_path = req["alpha_out_path"]
+        width = req["width"]
+        height = req["height"]
+        frames = req["frames"]
+        with open(rgb_path, "rb") as f:
+            rgb_bytes = f.read()
+        rgb = struct.unpack(f"<{len(rgb_bytes) // 4}f", rgb_bytes)
+        pixel_count = frames * height * width
+        alpha = []
+        for i in range(pixel_count):
+            base = i * 3
+            alpha.append(0.2126 * rgb[base] + 0.7152 * rgb[base + 1] + 0.0722 * rgb[base + 2])
+        with open(alpha_out_path, "wb") as f:
+            f.write(struct.pack(f"<{pixel_count}f", *alpha))
+        print(json.dumps({"ok": True}), flush=True)
+    elif req.get("cmd") == "probe":
+        print(json.dumps({"ok": True, "peak_bytes": 1073741824}), flush=True)
+    else:
+        print(json.dumps({"ok": False, "error": "unknown command"}), flush=True)
+"#;
+
+const EXITING_DOUBLE: &str = r#"#!/usr/bin/env python3
+import sys
+
+print("runner boom", file=sys.stderr, flush=True)
+sys.exit(3)
+"#;
+
+#[expect(
+    clippy::expect_used,
+    reason = "test helper — panics intentionally on failure"
+)]
+fn write_script(dir: &tempfile::TempDir, name: &str, script: &str) -> std::path::PathBuf {
+    let path = dir.path().join(name);
+    std::fs::write(&path, script).expect("write test script");
+    path
+}
+
 fn python3_present() -> bool {
     Command::new("python3")
         .arg("--version")
@@ -178,6 +230,88 @@ fn run_chunk_via_double_luminance() {
             "alpha[{i}] = {a:.6}, expected ~0.2126 (Rec.709 luminance of pure red)"
         );
     }
+}
+
+#[test]
+fn concurrent_run_chunk_calls_are_serialized() {
+    if !python3_present() {
+        eprintln!("SKIP concurrent_run_chunk_calls_are_serialized: python3 not on PATH");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let double = write_script(&dir, "slow_double.py", SLOW_PROTOCOL_DOUBLE);
+    let backend = std::sync::Arc::new(
+        PythonBackend::spawn(Path::new("python3"), &double, &[]).expect("spawn slow double"),
+    );
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let make_chunk = |rgb: [f32; 3]| {
+        let pixel_count = 8_usize.saturating_mul(6);
+        let frames = std::iter::repeat_n(rgb, pixel_count)
+            .flatten()
+            .collect::<Vec<f32>>();
+        VideoChunk::new(0, 8, 6, 1, frames).expect("valid chunk")
+    };
+
+    let red = make_chunk([1.0, 0.0, 0.0]);
+    let green = make_chunk([0.0, 1.0, 0.0]);
+
+    let backend_red = std::sync::Arc::clone(&backend);
+    let barrier_red = std::sync::Arc::clone(&barrier);
+    let red_thread = std::thread::spawn(move || {
+        barrier_red.wait();
+        backend_red.run_chunk(&red, 1, None)
+    });
+
+    let backend_green = std::sync::Arc::clone(&backend);
+    let barrier_green = std::sync::Arc::clone(&barrier);
+    let green_thread = std::thread::spawn(move || {
+        barrier_green.wait();
+        backend_green.run_chunk(&green, 2, None)
+    });
+
+    let red_alpha = red_thread.join().expect("red thread").expect("red run");
+    let green_alpha = green_thread
+        .join()
+        .expect("green thread")
+        .expect("green run");
+
+    assert!(
+        red_alpha
+            .data
+            .iter()
+            .all(|value| (*value - 0.2126_f32).abs() < 1e-4_f32),
+        "red chunk alpha was corrupted by concurrent call"
+    );
+    assert!(
+        green_alpha
+            .data
+            .iter()
+            .all(|value| (*value - 0.7152_f32).abs() < 1e-4_f32),
+        "green chunk alpha was corrupted by concurrent call"
+    );
+}
+
+#[test]
+fn runner_exit_reports_runner_error_not_json_parse() {
+    if !python3_present() {
+        eprintln!("SKIP runner_exit_reports_runner_error_not_json_parse: python3 not on PATH");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let double = write_script(&dir, "exit_double.py", EXITING_DOUBLE);
+    let backend = PythonBackend::spawn(Path::new("python3"), &double, &[]).expect("spawn double");
+
+    let scale = ScaleFactors::default();
+    let shape = PixelShape::new(25, 512, 512, scale).expect("valid shape");
+    let err = backend.probe(shape).expect_err("runner should exit");
+
+    assert!(
+        matches!(err, ltx_backend::BackendError::RunnerError { ref msg, .. } if msg == "runner exited"),
+        "expected runner exited error, got {err:?}"
+    );
 }
 
 #[test]

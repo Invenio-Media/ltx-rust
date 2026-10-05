@@ -186,6 +186,32 @@ fn frame_stream_empty_range_returns_error() {
     );
 }
 
+#[test]
+fn frame_stream_short_stream_returns_error() {
+    if !ffmpeg_present() {
+        eprintln!("SKIP frame_stream_short_stream_returns_error: ffmpeg not on PATH");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clip = make_test_clip(&dir);
+    let err = ltx_io::FrameStream::open_with_size(&clip, 0, 30, 64, 48)
+        .expect("open stream")
+        .collect_frames()
+        .expect_err("short stream should error");
+
+    assert!(
+        matches!(
+            err,
+            ltx_io::IoError::ShortFrameStream {
+                index: 25,
+                end_frame: 30
+            }
+        ),
+        "expected ShortFrameStream at frame 25, got {err:?}"
+    );
+}
+
 // ── EXR alpha matte ─────────────────────────────────────────────────────────
 
 #[test]

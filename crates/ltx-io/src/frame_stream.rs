@@ -140,8 +140,8 @@ impl FrameStream {
 
     /// Read the next frame from `ffmpeg`'s stdout.
     ///
-    /// Returns `None` when all frames in the range have been consumed or
-    /// `ffmpeg` closes its stdout early.
+    /// Returns `None` when all frames in the range have been consumed.
+    /// Early `ffmpeg` EOF before `end_frame` is reported as an error.
     ///
     /// # Errors
     /// [`IoError::Io`] on unexpected I/O failure; [`IoError::DimensionOverflow`]
@@ -168,7 +168,14 @@ impl FrameStream {
         let mut buf = vec![0u8; byte_count];
         match self.reader.read_exact(&mut buf) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                let index = self.next_index;
+                self.next_index = self.end_frame;
+                return Some(Err(IoError::ShortFrameStream {
+                    index,
+                    end_frame: self.end_frame,
+                }));
+            }
             Err(e) => return Some(Err(IoError::Io(e))),
         }
 
