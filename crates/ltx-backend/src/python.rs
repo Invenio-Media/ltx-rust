@@ -120,6 +120,7 @@ struct Inner {
     child: Child,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    poisoned: Option<String>,
 }
 
 fn stderr_tail_text(stderr_tail: &Arc<Mutex<Vec<String>>>) -> String {
@@ -147,30 +148,64 @@ fn map_runner_write_error(
     }
 }
 
+fn poison<T>(
+    inner: &mut Inner,
+    msg: impl Into<String>,
+    err: BackendError,
+) -> Result<T, BackendError> {
+    inner.poisoned = Some(msg.into());
+    Err(err)
+}
+
 impl Inner {
     fn round_trip(
         &mut self,
         req: &Request<'_>,
         stderr_tail: &Arc<Mutex<Vec<String>>>,
     ) -> Result<Response, BackendError> {
-        let line = serde_json::to_string(req)?;
-        self.stdin
-            .write_all(line.as_bytes())
-            .map_err(|e| map_runner_write_error(e, stderr_tail))?;
-        self.stdin
-            .write_all(b"\n")
-            .map_err(|e| map_runner_write_error(e, stderr_tail))?;
-        self.stdin
-            .flush()
-            .map_err(|e| map_runner_write_error(e, stderr_tail))?;
-
-        let mut resp_line = String::new();
-        let bytes = self.stdout.read_line(&mut resp_line)?;
-        if bytes == 0 {
-            return Err(runner_exited(stderr_tail));
+        if let Some(msg) = &self.poisoned {
+            return Err(BackendError::RunnerError {
+                msg: format!("runner protocol poisoned after previous failure: {msg}"),
+                stderr: stderr_tail_text(stderr_tail),
+            });
         }
 
-        let resp: Response = serde_json::from_str(resp_line.trim_end())?;
+        let line = serde_json::to_string(req)?;
+        if let Err(e) = self.stdin.write_all(line.as_bytes()) {
+            return poison(
+                self,
+                "write request failed",
+                map_runner_write_error(e, stderr_tail),
+            );
+        }
+        if let Err(e) = self.stdin.write_all(b"\n") {
+            return poison(
+                self,
+                "write newline failed",
+                map_runner_write_error(e, stderr_tail),
+            );
+        }
+        if let Err(e) = self.stdin.flush() {
+            return poison(
+                self,
+                "flush request failed",
+                map_runner_write_error(e, stderr_tail),
+            );
+        }
+
+        let mut resp_line = String::new();
+        let bytes = match self.stdout.read_line(&mut resp_line) {
+            Ok(bytes) => bytes,
+            Err(e) => return poison(self, "read response failed", BackendError::Io(e)),
+        };
+        if bytes == 0 {
+            return poison(self, "runner exited", runner_exited(stderr_tail));
+        }
+
+        let resp: Response = match serde_json::from_str(resp_line.trim_end()) {
+            Ok(resp) => resp,
+            Err(e) => return poison(self, "invalid runner response JSON", BackendError::Json(e)),
+        };
         if resp.ok {
             Ok(resp)
         } else {
@@ -199,8 +234,8 @@ impl PythonBackend {
     /// Spawn `alphagen_runner.py`.
     ///
     /// # Parameters
-    /// - `python`: Python interpreter (e.g. the reference venv at
-    ///   `/Users/keithmanlove/Documents/Projects/ltx-rust-tools/LTX-2/.venv/bin/python`).
+    /// - `python`: Python interpreter for the environment that has the
+    ///   alpha-gen dependencies installed.
     /// - `script`: path to `python/alphagen_runner.py` in this repo.
     /// - `extra_args`: forwarded to the runner.  At minimum:
     ///   `["--transformer", "<path>", "--video-vae", "<path>",
@@ -253,6 +288,7 @@ impl PythonBackend {
                 child,
                 stdin: BufWriter::new(stdin),
                 stdout: BufReader::new(stdout),
+                poisoned: None,
             }),
             stderr_tail: tail,
             tmp,
@@ -292,9 +328,6 @@ impl PythonBackend {
     }
 
     fn read_alpha_bin(alpha_path: &Path, chunk: &VideoChunk) -> Result<AlphaChunk, BackendError> {
-        let raw = std::fs::read(alpha_path)?;
-        let data = le_bytes_to_f32_vec(&raw)?;
-
         let w = usize::try_from(chunk.width).map_err(|_| BackendError::DimensionOverflow)?;
         let h = usize::try_from(chunk.height).map_err(|_| BackendError::DimensionOverflow)?;
         let f = usize::try_from(chunk.frame_count).map_err(|_| BackendError::DimensionOverflow)?;
@@ -302,13 +335,21 @@ impl PythonBackend {
             .checked_mul(h)
             .and_then(|n| n.checked_mul(w))
             .ok_or(BackendError::DimensionOverflow)?;
+        let expected_bytes = expected
+            .checked_mul(4)
+            .ok_or(BackendError::DimensionOverflow)?;
 
-        if data.len() != expected {
-            return Err(BackendError::DataLengthMismatch {
-                expected,
-                got: data.len(),
-            });
+        let got_bytes = usize::try_from(std::fs::metadata(alpha_path)?.len())
+            .map_err(|_| BackendError::DimensionOverflow)?;
+        if got_bytes != expected_bytes {
+            let got = got_bytes
+                .checked_div(4)
+                .ok_or(BackendError::DimensionOverflow)?;
+            return Err(BackendError::DataLengthMismatch { expected, got });
         }
+
+        let raw = std::fs::read(alpha_path)?;
+        let data = le_bytes_to_f32_vec(&raw)?;
 
         Ok(AlphaChunk {
             start_frame: chunk.start_frame,
@@ -366,7 +407,17 @@ impl AlphaBackend for PythonBackend {
         let kf_path = cond
             .map(|kf| Self::write_keyframes_json(tmp, kf))
             .transpose()?;
-        let kf_path_str = kf_path.as_ref().and_then(|p| p.to_str());
+        let kf_path_str = kf_path
+            .as_ref()
+            .map(|p| {
+                p.to_str().ok_or_else(|| {
+                    BackendError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "non-UTF-8 keyframe json path",
+                    ))
+                })
+            })
+            .transpose()?;
 
         let req = Request::Run {
             rgb_path: rgb_path_str,
@@ -389,10 +440,12 @@ impl Drop for PythonBackend {
         // stdin pipe while we are inside `drop`, so waiting first can deadlock.
         // Kill is safe here: all requested work has already completed before a
         // `PythonBackend` is dropped.
-        if let Ok(mut inner) = self.inner.lock() {
-            let _ = inner.child.kill();
-            let _ = inner.child.wait();
-        }
+        let inner = match self.inner.get_mut() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let _ = inner.child.kill();
+        let _ = inner.child.wait();
     }
 }
 

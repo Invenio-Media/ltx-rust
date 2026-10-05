@@ -131,6 +131,13 @@ print("runner boom", file=sys.stderr, flush=True)
 sys.exit(3)
 "#;
 
+const INVALID_JSON_DOUBLE: &str = r#"#!/usr/bin/env python3
+import sys
+
+for line in sys.stdin:
+    print("not json", flush=True)
+"#;
+
 #[expect(
     clippy::expect_used,
     reason = "test helper — panics intentionally on failure"
@@ -311,6 +318,36 @@ fn runner_exit_reports_runner_error_not_json_parse() {
     assert!(
         matches!(err, ltx_backend::BackendError::RunnerError { ref msg, .. } if msg == "runner exited"),
         "expected runner exited error, got {err:?}"
+    );
+}
+
+#[test]
+fn invalid_protocol_response_poisons_backend() {
+    if !python3_present() {
+        eprintln!("SKIP invalid_protocol_response_poisons_backend: python3 not on PATH");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let double = write_script(&dir, "invalid_json_double.py", INVALID_JSON_DOUBLE);
+    let backend = PythonBackend::spawn(Path::new("python3"), &double, &[]).expect("spawn double");
+
+    let scale = ScaleFactors::default();
+    let shape = PixelShape::new(25, 512, 512, scale).expect("valid shape");
+    let first_err = backend.probe(shape).expect_err("invalid JSON response");
+    assert!(
+        matches!(first_err, ltx_backend::BackendError::Json(_)),
+        "expected JSON error, got {first_err:?}"
+    );
+
+    let second_err = backend.probe(shape).expect_err("poisoned backend");
+    assert!(
+        matches!(
+            second_err,
+            ltx_backend::BackendError::RunnerError { ref msg, .. }
+                if msg.contains("runner protocol poisoned")
+        ),
+        "expected poisoned runner error, got {second_err:?}"
     );
 }
 

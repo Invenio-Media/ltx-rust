@@ -92,6 +92,7 @@ impl FrameStream {
             .args([
                 "-v",
                 "quiet",
+                "-nostdin",
                 "-i",
                 path_str,
                 "-vf",
