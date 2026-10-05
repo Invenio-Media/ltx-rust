@@ -1,0 +1,27 @@
+[package]
+name = "ltx-dit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LTX-2.5 22B DiT video transformer in Burn (video stream only)."
+
+[features]
+default = ["ndarray"]
+ndarray = ["burn/ndarray"]
+metal = ["burn/metal"]
+cuda = ["burn/cuda"]
+
+[dependencies]
+burn = { workspace = true, features = ["std"] }
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+burn = { workspace = true, features = ["ndarray", "std"] }
+
+[lints]
+workspace = true
