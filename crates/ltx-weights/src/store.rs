@@ -553,21 +553,22 @@ impl WeightStore {
             })
             .collect();
 
+        let mut pending_deltas: Vec<(String, Vec<f32>)> = Vec::new();
+
         for (base_key, key_a, key_b) in lora_pairs {
             if !self.entries.contains_key(&base_key) {
                 report.unmatched_lora_keys.push(key_a);
                 continue;
             }
 
-            let Some((shape_a, a_f32)) = lora.read_f32(&key_a) else {
+            let Some((shape_a, a_f32)) = lora.read_f32(&key_a)? else {
                 report.unmatched_lora_keys.push(key_a);
                 continue;
             };
-            let Some((shape_b, b_f32)) = lora.read_f32(&key_b) else {
+            let Some((shape_b, b_f32)) = lora.read_f32(&key_b)? else {
                 report.unmatched_lora_keys.push(key_a);
                 continue;
             };
-
             let rank_a = shape_a.first().copied().unwrap_or(0);
             let rank_b = shape_b.get(1).copied().unwrap_or(0);
             if rank_a != rank_b || rank_a == 0 {
@@ -600,7 +601,7 @@ impl WeightStore {
                 .strip_suffix(lora_a_suffix)
                 .map_or_else(String::new, |p| format!("{p}.alpha"));
             let alpha = lora
-                .read_f32(&alpha_key)
+                .read_f32(&alpha_key)?
                 .and_then(|(_, v)| v.first().copied())
                 .unwrap_or_else(|| usize_to_f32(rank));
 
@@ -609,15 +610,30 @@ impl WeightStore {
 
             let delta = matmul_scaled(&b_f32, out_features, rank, &a_f32, in_features, coeff);
 
+            pending_deltas.push((base_key.clone(), delta));
+            report.matched_keys.push(base_key);
+        }
+
+        for (base_key, delta) in &pending_deltas {
+            if let Some(existing) = self.lora_deltas.get(base_key)
+                && existing.len() != delta.len()
+            {
+                return Err(WeightError::LoraShapeMismatch(base_key.clone()));
+            }
+        }
+
+        if report.matched_keys.is_empty() && !report.unmatched_lora_keys.is_empty() {
+            return Err(WeightError::NoLoraMatches);
+        }
+
+        for (base_key, delta) in pending_deltas {
             let entry_delta = self
                 .lora_deltas
-                .entry(base_key.clone())
-                .or_insert_with(|| vec![0.0f32; out_features.saturating_mul(in_features)]);
+                .entry(base_key)
+                .or_insert_with(|| vec![0.0f32; delta.len()]);
             for (acc, d) in entry_delta.iter_mut().zip(delta.iter()) {
                 *acc += *d;
             }
-
-            report.matched_keys.push(base_key);
         }
 
         Ok(report)

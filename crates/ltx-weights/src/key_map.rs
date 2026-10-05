@@ -43,12 +43,12 @@ pub enum Rule {
     DropPrefix(String),
     /// Drop keys whose post-rename name ends with this suffix.
     DropSuffix(String),
-    /// Apply additional renames to post-filter keys.
+    /// Apply a prefix rename to post-filter keys.
     ///
     /// Used for `t_embedder.mlp.*` → `t_embedder.timestep_embedder.*` in the
     /// diffusion VAE decoder.
     RenameExact {
-        /// Substring to find (in the already-renamed key).
+        /// Prefix to find in the already-renamed key.
         find: String,
         /// Replacement.
         replace: String,
@@ -245,9 +245,14 @@ impl KeyMap {
                         return None;
                     }
                 }
-                Rule::Replace { find, replace } | Rule::RenameExact { find, replace } => {
+                Rule::Replace { find, replace } => {
                     if key.contains(find.as_str()) {
                         key = key.replace(find.as_str(), replace.as_str());
+                    }
+                }
+                Rule::RenameExact { find, replace } => {
+                    if let Some(suffix) = key.strip_prefix(find.as_str()) {
+                        key = format!("{replace}{suffix}");
                     }
                 }
                 Rule::DropPrefix(p) => {

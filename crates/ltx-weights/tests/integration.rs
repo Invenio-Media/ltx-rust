@@ -536,6 +536,53 @@ fn lora_unmatched_keys_reported() {
     );
 }
 
+#[test]
+fn lora_all_unmatched_errors() {
+    let base_bytes = f32_bytes(&[1.0f32]);
+    let sft = make_safetensors(None, &[("present.weight", &[1], "F32", &base_bytes)]);
+    let (_tmp, path) = write_tmp(&sft);
+    let lora_sft = make_safetensors(
+        None,
+        &[
+            ("absent.lora_A.weight", &[1, 1], "F32", &f32_bytes(&[1.0])),
+            ("absent.lora_B.weight", &[1, 1], "F32", &f32_bytes(&[1.0])),
+        ],
+    );
+    let (_lora_tmp, lora_path) = write_tmp(&lora_sft);
+
+    let mut store = WeightStore::open(&[&path], &KeyMap::identity()).unwrap();
+    let lora = LoraFile::open(&lora_path).unwrap();
+    let err = store.merge_lora(&lora, 1.0).unwrap_err();
+    assert!(
+        matches!(err, WeightError::NoLoraMatches),
+        "expected NoLoraMatches, got {err:?}"
+    );
+}
+
+#[test]
+fn lora_decode_error_is_not_reported_as_unmatched() {
+    let base_bytes = f32_bytes(&[0.0f32]);
+    let sft = make_safetensors(None, &[("layer.weight", &[1, 1], "F32", &base_bytes)]);
+    let (_tmp, path) = write_tmp(&sft);
+    let int_bytes = 7_i32.to_le_bytes();
+    let lora_sft = make_safetensors(
+        None,
+        &[
+            ("layer.lora_A.weight", &[1, 1], "I32", &int_bytes),
+            ("layer.lora_B.weight", &[1, 1], "F32", &f32_bytes(&[1.0])),
+        ],
+    );
+    let (_lora_tmp, lora_path) = write_tmp(&lora_sft);
+
+    let mut store = WeightStore::open(&[&path], &KeyMap::identity()).unwrap();
+    let lora = LoraFile::open(&lora_path).unwrap();
+    let err = store.merge_lora(&lora, 1.0).unwrap_err();
+    assert!(
+        matches!(&err, WeightError::UnsupportedDtype { key, .. } if key == "layer.lora_A.weight"),
+        "expected UnsupportedDtype for LoRA A, got {err:?}"
+    );
+}
+
 // ─── LoRA ic_layout ──────────────────────────────────────────────────────────
 
 #[test]

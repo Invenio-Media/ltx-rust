@@ -32,6 +32,9 @@ use crate::{
     fp8::{e4m3fn_slice_to_f32, e5m2_slice_to_f32},
 };
 
+/// Shape and f32 payload decoded from one `LoRA` tensor.
+pub type LoraTensor = (Vec<usize>, Vec<f32>);
+
 // ─── LoraFile ─────────────────────────────────────────────────────────────────
 
 /// An opened `LoRA` safetensors file ready for merging.
@@ -111,16 +114,35 @@ impl LoraFile {
         self.tensors.keys().map(String::as_str)
     }
 
-    /// Read a tensor as f32 values, or `None` if the name is not present.
-    #[must_use]
-    pub fn read_f32(&self, name: &str) -> Option<(Vec<usize>, Vec<f32>)> {
-        let info = self.tensors.get(name)?;
+    /// Read a tensor as f32 values, or `Ok(None)` if the name is not present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WeightError::InvalidTensorData`] when the stored byte range is
+    /// outside the safetensors mmap, or [`WeightError::UnsupportedDtype`] when
+    /// the tensor dtype is not supported for `LoRA` merging.
+    pub fn read_f32(&self, name: &str) -> Result<Option<LoraTensor>, WeightError> {
+        let Some(info) = self.tensors.get(name) else {
+            return Ok(None);
+        };
         let (rel_start, rel_end) = info.data_offsets;
         let start = self.data_start.saturating_add(rel_start);
         let end = self.data_start.saturating_add(rel_end);
-        let bytes = self.mmap.get(start..end)?;
-        let f32s = decode_lora_bytes(bytes, info.dtype).ok()?;
-        Some((info.shape.clone(), f32s))
+        let bytes = self
+            .mmap
+            .get(start..end)
+            .ok_or_else(|| WeightError::InvalidTensorData {
+                key: name.to_owned(),
+                message: "byte range is outside the mapped file".to_owned(),
+            })?;
+        let f32s = decode_lora_bytes(bytes, info.dtype).map_err(|e| match e {
+            WeightError::UnsupportedDtype { dtype, .. } => WeightError::UnsupportedDtype {
+                key: name.to_owned(),
+                dtype,
+            },
+            other => other,
+        })?;
+        Ok(Some((info.shape.clone(), f32s)))
     }
 
     /// Read a tensor's shape and dtype info.

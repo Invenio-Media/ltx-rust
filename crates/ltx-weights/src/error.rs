@@ -65,6 +65,10 @@ pub enum WeightError {
         b_rank: usize,
     },
 
+    /// A `LoRA` file had layer keys, but none matched this store.
+    #[error("LoRA file did not match any base weight keys")]
+    NoLoraMatches,
+
     /// The `__metadata__["config"]` key is absent.
     #[error("checkpoint metadata has no \"config\" field")]
     MissingConfig,
