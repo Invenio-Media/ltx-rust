@@ -22,8 +22,8 @@
 //! The `q_chunk` field, when `Some(chunk_size)`, splits the query along the
 //! sequence dimension and processes each chunk independently.  This bounds peak
 //! memory to `O(H × chunk_size × T_k)` instead of `O(H × T_q × T_k)` while
-//! producing **exactly** the same numerics as the full-matrix path (only Q is
-//! chunked; the full K/V remain on device, so the per-row softmax is identical).
+//! producing mathematically identical attention rows (only Q is chunked; the
+//! full K/V remain on device, so the per-row softmax inputs are identical).
 
 use burn::nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
@@ -250,7 +250,10 @@ fn chunked_sdp_attention<B: Backend>(
     scale: f32,
     chunk_size: usize,
 ) -> Tensor<B, 4> {
-    let t_q = q.dims()[2];
+    if chunk_size == 0 {
+        return sdp_attention(q, k, v, mask, scale);
+    }
+    let [_batch, _heads, t_q, _d_head] = q.dims();
     let n_chunks = t_q.div_ceil(chunk_size);
     if n_chunks <= 1 {
         return sdp_attention(q, k, v, mask, scale);

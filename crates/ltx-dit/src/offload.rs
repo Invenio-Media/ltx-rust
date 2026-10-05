@@ -6,20 +6,21 @@
 //!
 //! # Current implementation
 //!
-//! On the **`ndarray` CPU backend** there is no host/device distinction, so
-//! [`OffloadMode::Stream`] and [`OffloadMode::Resident`] produce the same peak
-//! footprint and **identical numerical outputs** — verified by the parity test.
+//! The model stores all blocks in memory today. [`OffloadMode::Stream`] is an
+//! accounting mode for estimating the resident weight footprint that a streaming
+//! implementation would have; it does not move weights between host and device
+//! during [`VideoTransformer::forward`](crate::model::VideoTransformer::forward).
 //!
-//! On GPU backends (wgpu, cuda, metal) a future pass would implement actual
-//! block migration by serialising each block to a host `Vec<f32>` record before
-//! the forward step of that group and loading it back to the device.  The
-//! interface is already designed for this: the model stores all blocks as
+//! On GPU backends (wgpu, cuda, metal) a future pass can implement actual block
+//! migration by serialising each block to a host `Vec<f32>` record before the
+//! forward step of that group and loading it back to the device. The interface
+//! is already designed for this: the model stores all blocks as
 //! `Vec<TransformerBlock<B>>` and the forward loop receives the [`OffloadMode`].
 //!
 //! # Resident-bytes formula
 //!
 //! One `TransformerBlock` for the 22B config (`inner_dim = 4096`,
-//! `cross_attention_dim = 4096`, `d_head = 128`, `H = 32`, no FFN bias):
+//! `cross_attention_dim = 4096`, `d_head = 128`, `H = 32`):
 //!
 //! ```text
 //! Self-attn:  to_q + to_k + to_v = 3 × (inner × inner) weights
@@ -28,7 +29,7 @@
 //!             to_out = inner × inner + inner
 //! Cross-attn: to_q = inner²,  to_k + to_v = 2 × (cross × inner)
 //!             + same norms and to_out
-//! FFN:        linear_in = 4 × inner² (no bias), linear_out = 4 × inner²
+//! FFN:        linear_in = 4 × inner² (+ optional 4 × inner bias), linear_out = 4 × inner² (+ optional inner bias)
 //! scale_shift_table: adaln_coeff × inner (6 or 9)
 //! ```
 //!
@@ -86,10 +87,11 @@ pub fn block_param_count(c: &DiTConfig) -> u64 {
     let ca_qk_norm = 2u64.saturating_mul(inner);
     let ca_out = inner.saturating_mul(inner).saturating_add(inner);
 
-    // Optional per-head gating (gate_proj weight + bias for both self and cross)
+    // Optional per-head gating: one gate projection in self-attention and one
+    // in cross-attention.
     let gate = if c.flags.apply_gated_attention {
-        4u64.saturating_mul(inner.saturating_mul(heads))
-            .saturating_add(4u64.saturating_mul(heads))
+        2u64.saturating_mul(inner.saturating_mul(heads))
+            .saturating_add(2u64.saturating_mul(heads))
     } else {
         0
     };
@@ -206,4 +208,31 @@ pub fn resident_bytes(c: &DiTConfig, mode: OffloadMode) -> u64 {
         .saturating_add(ht_f32)
         // 4 bytes per f32
         .saturating_mul(4)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{DiTConfig, DiTFlags};
+
+    #[test]
+    fn gated_attention_adds_two_gate_projections_per_block() {
+        let base = DiTConfig {
+            num_attention_heads: 2,
+            attention_head_dim: 3,
+            cross_attention_dim: 6,
+            flags: DiTFlags {
+                apply_gated_attention: false,
+                ..DiTFlags::default()
+            },
+            ..DiTConfig::default()
+        };
+        let mut gated = base.clone();
+        gated.flags.apply_gated_attention = true;
+
+        let diff = block_param_count(&gated).saturating_sub(block_param_count(&base));
+        let inner = u64_of(base.inner_dim());
+        let heads = u64_of(base.num_attention_heads);
+        assert_eq!(diff, 2 * (inner * heads + heads));
+    }
 }

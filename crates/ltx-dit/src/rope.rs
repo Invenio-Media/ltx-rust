@@ -154,9 +154,27 @@ fn interleaved_freqs_cis<B: Backend>(
     n_tokens: usize,
     device: &B::Device,
 ) -> (Tensor<B, 4>, Tensor<B, 4>) {
-    // repeat_dim(2, 2): each element repeated twice (interleaved pair).
-    let cos_rep = freqs.clone().cos().repeat_dim(2, 2);
-    let sin_rep = freqs.sin().repeat_dim(2, 2);
+    let cos_base = freqs.clone().cos();
+    let sin_base = freqs.sin();
+    let base_dim = cos_base.dims()[2];
+
+    // Expand each angle to the adjacent feature pair: [a, b] -> [a, a, b, b].
+    let cos_rep = Tensor::cat(
+        vec![
+            cos_base.clone().reshape([batch, n_tokens, base_dim, 1]),
+            cos_base.reshape([batch, n_tokens, base_dim, 1]),
+        ],
+        3,
+    )
+    .reshape([batch, n_tokens, base_dim.saturating_mul(2)]);
+    let sin_rep = Tensor::cat(
+        vec![
+            sin_base.clone().reshape([batch, n_tokens, base_dim, 1]),
+            sin_base.reshape([batch, n_tokens, base_dim, 1]),
+        ],
+        3,
+    )
+    .reshape([batch, n_tokens, base_dim.saturating_mul(2)]);
 
     let current = cos_rep.dims()[2];
     let pad_size = inner_dim.saturating_sub(current);
@@ -271,4 +289,33 @@ fn make_freq_grid(theta: f64, grid_size: usize) -> Vec<f32> {
     (0..grid_size)
         .map(|i| (theta.powf(i as f64 / denom) * PI / 2.0) as f32)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+    use burn::prelude::Device;
+
+    type B = NdArray<f32>;
+
+    #[test]
+    fn interleaved_freqs_repeat_each_angle_for_adjacent_pair() {
+        let device = Device::<B>::default();
+        let freqs =
+            Tensor::<B, 1>::from_floats([0.0_f32, 1.0_f32].as_slice(), &device).reshape([1, 1, 2]);
+        let (cos, sin) = interleaved_freqs_cis(freqs, 4, 1, 1, &device);
+
+        let cos_vals: Vec<f32> = cos.into_data().to_vec().unwrap();
+        let sin_vals: Vec<f32> = sin.into_data().to_vec().unwrap();
+        let expected_cos = [1.0_f32, 1.0, 1.0_f32.cos(), 1.0_f32.cos()];
+        let expected_sin = [0.0_f32, 0.0, 1.0_f32.sin(), 1.0_f32.sin()];
+
+        for (got, expected) in cos_vals.iter().zip(expected_cos) {
+            assert!((*got - expected).abs() < 1e-6_f32);
+        }
+        for (got, expected) in sin_vals.iter().zip(expected_sin) {
+            assert!((*got - expected).abs() < 1e-6_f32);
+        }
+    }
 }

@@ -165,9 +165,9 @@ impl<B: Backend> VideoTransformer<B> {
 
     /// Forward pass.
     ///
-    /// `mode` controls whether block weights are streamed from host (see
-    /// [`crate::offload`]).  On the `ndarray` CPU backend both modes are
-    /// numerically identical.
+    /// `mode` is accepted for API parity with the offload accounting helpers.
+    /// This implementation keeps all blocks resident; [`OffloadMode::Stream`]
+    /// changes resident-byte estimates but does not move weights during forward.
     ///
     /// Returns the predicted velocity (or x0, matching the reference output
     /// convention) of shape `(B, T, out_channels)`.
