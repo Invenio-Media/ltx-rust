@@ -1,0 +1,23 @@
+[package]
+name = "ltx-vae"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LTX-2.5 video VAE encoder in Burn (causal 3-D convolution, tiled encode)."
+
+[features]
+default = ["burn/ndarray"]
+metal = ["burn/metal"]
+cuda = ["burn/cuda"]
+
+[dependencies]
+burn.workspace = true
+ltx-shape = { path = "../ltx-shape" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
