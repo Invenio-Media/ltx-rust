@@ -107,7 +107,7 @@ pub enum CalibrationError<E> {
 // ── DiT calibration ───────────────────────────────────────────────────────────
 
 /// Default `DiT` calibration frame counts.
-const DEFAULT_FRAME_COUNTS: [u32; 3] = [17, 33, 49];
+const DEFAULT_FRAME_COUNTS: [u32; 4] = [17, 33, 49, 65];
 
 /// Calibrates the `DiT` peak-memory model by varying the frame count at a fixed
 /// resolution.

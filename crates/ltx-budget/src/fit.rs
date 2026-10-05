@@ -11,8 +11,8 @@ use thiserror::Error;
 /// Errors that occur during a least-squares fit.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FitError {
-    /// Fewer than 3 distinct x-values were provided.
-    #[error("need at least 3 distinct x values, got {0}")]
+    /// Fewer distinct x-values were provided than the fit requires.
+    #[error("need more distinct x values, got {0}")]
     TooFewDistinct(usize),
     /// At least one sample contains a non-finite value.
     #[error("non-finite value in samples")]
@@ -21,6 +21,8 @@ pub enum FitError {
     #[error("degenerate system: normal-equations matrix is singular")]
     Singular,
 }
+
+const RELATIVE_SINGULAR_EPS: f64 = f64::EPSILON * 64.0;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -88,6 +90,22 @@ pub(crate) fn validate(samples: &[(f64, u64)], min_distinct: usize) -> Result<()
 fn minor2(a: f64, b: f64, c: f64, d: f64) -> f64 {
     // a·d + b·(−c)
     b.mul_add(-c, a * d)
+}
+
+#[inline]
+const fn max_abs3(a: f64, b: f64, c: f64) -> f64 {
+    a.abs().max(b.abs()).max(c.abs())
+}
+
+#[inline]
+const fn max_abs4(a: f64, b: f64, c: f64, d: f64) -> f64 {
+    max_abs3(a, b, c).max(d.abs())
+}
+
+#[inline]
+fn is_singular2(det: f64, a00: f64, a01: f64, a10: f64, a11: f64) -> bool {
+    let scale = max_abs4(a00, a01, a10, a11).max(1.0);
+    det.abs() <= RELATIVE_SINGULAR_EPS * scale * scale
 }
 
 // ── Sums ─────────────────────────────────────────────────────────────────────
@@ -168,7 +186,13 @@ fn solve3(s: &Sums) -> Option<(f64, f64, f64)> {
     let m02 = minor2(a10, a11, a20, a21);
     let det = a02.mul_add(m02, a01.mul_add(-m01, a00 * m00));
 
-    if det.abs() < 1e-30 {
+    let scale = max_abs3(
+        max_abs3(a00, a01, a02),
+        max_abs3(a10, a11, a12),
+        max_abs3(a20, a21, a22),
+    )
+    .max(1.0);
+    if det.abs() <= RELATIVE_SINGULAR_EPS * scale * scale * scale {
         return None;
     }
 
@@ -207,7 +231,7 @@ fn solve3(s: &Sums) -> Option<(f64, f64, f64)> {
 fn solve2(n: f64, sx: f64, sx2: f64, sy: f64, sxy: f64) -> Option<(f64, f64)> {
     // det = n·sx2 − sx² = n·Σx² − (Σx)²
     let det = sx.mul_add(-sx, n * sx2);
-    if det.abs() < 1e-30 {
+    if is_singular2(det, n, sx, sx, sx2) {
         return None;
     }
     let r = sx.mul_add(-sxy, sy * sx2) / det;
@@ -246,21 +270,45 @@ pub(crate) struct FitResult {
     pub residual: f64,
 }
 
+fn max_sample_bytes(samples: &[(f64, u64)]) -> f64 {
+    samples
+        .iter()
+        .map(|&(_, y)| f64_of_u64(y))
+        .fold(0.0_f64, f64::max)
+}
+
+fn finish_fit(samples: &[(f64, u64)], resident: f64, linear: f64, quadratic: f64) -> FitResult {
+    let resident = resident.max(0.0);
+    let res = residual(samples, resident, linear, quadratic);
+    FitResult {
+        resident,
+        linear,
+        quadratic,
+        residual: res,
+    }
+}
+
+fn constant_fit(samples: &[(f64, u64)]) -> FitResult {
+    finish_fit(samples, max_sample_bytes(samples), 0.0, 0.0)
+}
+
 /// Fits `y = resident + linear·x + quadratic·x²` from `samples`.
 ///
-/// Requires at least 3 distinct x-values.  If the unconstrained fit yields
-/// `quadratic < 0`, the model is refit with `quadratic` fixed at 0 (linear
-/// regression on x).  If `linear < 0` in the unconstrained fit, the model is
-/// refit with `linear` fixed at 0 (regression on x²).  When both are
-/// negative, the quadratic term is dropped first (fused attention gives
-/// `quadratic ≈ 0`).
-///
+/// Requires at least 4 distinct x-values. With only 3 points, a quadratic
+/// interpolates exactly and the residual cannot measure probe noise.
+/// If the unconstrained fit yields `quadratic < 0`, the model is refit with
+/// `quadratic` fixed at 0 (linear regression on x). If that refit still gives
+/// a negative slope, the model falls back to a conservative constant peak. If
+/// `linear < 0` in the unconstrained fit, the model is refit with `linear`
+/// fixed at 0 (regression on x²), with the same constant fallback for a
+/// negative quadratic term.
 /// # Errors
-/// - [`FitError::TooFewDistinct`] – fewer than 3 distinct x-values.
+///
+/// - [`FitError::TooFewDistinct`] – fewer than 4 distinct x-values.
 /// - [`FitError::NonFinite`] – a non-finite value in `samples`.
 /// - [`FitError::Singular`] – the normal-equations matrix is singular.
 pub(crate) fn fit_quadratic(samples: &[(f64, u64)]) -> Result<FitResult, FitError> {
-    validate(samples, 3)?;
+    validate(samples, 4)?;
 
     // Scale x to t ∈ (0, 1] to reduce the condition number of the 3×3
     // normal-equations matrix.  Without this, sums of x⁴ at token counts
@@ -286,13 +334,10 @@ pub(crate) fn fit_quadratic(samples: &[(f64, u64)]) -> Result<FitResult, FitErro
         // Refit as linear in the normalised basis, then convert back.
         let (r_lin, a_lin_norm) = solve2(s.n, s.s1, s.s2, s.sy, s.s1y).ok_or(FitError::Singular)?;
         let a_lin = a_lin_norm * inv;
-        let res = residual(samples, r_lin, a_lin, 0.0);
-        return Ok(FitResult {
-            resident: r_lin,
-            linear: a_lin,
-            quadratic: 0.0,
-            residual: res,
-        });
+        if a_lin < 0.0 {
+            return Ok(constant_fit(samples));
+        }
+        return Ok(finish_fit(samples, r_lin, a_lin, 0.0));
     }
 
     if a < 0.0 {
@@ -300,22 +345,13 @@ pub(crate) fn fit_quadratic(samples: &[(f64, u64)]) -> Result<FitResult, FitErro
         let (r_quad, b_quad_norm) =
             solve2(s.n, s.s2, s.s4, s.sy, s.s2y).ok_or(FitError::Singular)?;
         let b_quad = b_quad_norm * inv * inv;
-        let res = residual(samples, r_quad, 0.0, b_quad);
-        return Ok(FitResult {
-            resident: r_quad,
-            linear: 0.0,
-            quadratic: b_quad,
-            residual: res,
-        });
+        if b_quad < 0.0 {
+            return Ok(constant_fit(samples));
+        }
+        return Ok(finish_fit(samples, r_quad, 0.0, b_quad));
     }
 
-    let res = residual(samples, r, a, b);
-    Ok(FitResult {
-        resident: r,
-        linear: a,
-        quadratic: b,
-        residual: res,
-    })
+    Ok(finish_fit(samples, r, a, b))
 }
 
 /// Fits `y = resident + linear·x` from `samples`.

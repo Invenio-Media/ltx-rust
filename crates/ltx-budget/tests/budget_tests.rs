@@ -212,6 +212,22 @@ fn fit_negative_linear_refits_as_quadratic_only() {
 }
 
 #[test]
+fn quadratic_fit_rejects_exact_three_point_interpolation() {
+    let samples = make_samples_exact(
+        1_000_000_000.0,
+        2_000.0,
+        0.1,
+        &[10_000.0, 30_000.0, 60_000.0],
+    );
+
+    let err = MemoryModel::fit_quadratic(&samples).unwrap_err();
+    assert!(
+        matches!(err, ltx_budget::FitError::TooFewDistinct(3)),
+        "expected TooFewDistinct(3), got {err:?}"
+    );
+}
+
+#[test]
 fn fit_too_few_distinct_x() {
     // All samples have the same x.
     let samples = vec![(10_000.0_f64, 2_000_000_000_u64); 5];
