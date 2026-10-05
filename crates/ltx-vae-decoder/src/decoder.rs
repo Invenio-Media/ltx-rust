@@ -247,11 +247,6 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
 
     // ── One diffusion step ────────────────────────────────────────────────
 
-    #[expect(
-        clippy::many_single_char_names,
-        clippy::arithmetic_side_effects,
-        reason = "tensor dimensions are named after axes; Burn tensor arithmetic runs on device"
-    )]
     fn forward_diff_step(
         &self,
         context: &Tensor<B, 5>,
@@ -348,12 +343,12 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
         for i in 0..n.saturating_sub(1) {
             let t_now = timesteps[i];
             let t_next = timesteps[i.saturating_add(1)];
-            let out = self.forward_diff_step(&context, x_t.clone(), t_now, device)?;
+            let out = self.forward_diff_step(context, x_t.clone(), t_now, device)?;
             x_t = Self::euler_step(x_t, out, t_now, t_next);
         }
 
         let t_last = timesteps[n.saturating_sub(1)];
-        let model_out = self.forward_diff_step(&context, x_t.clone(), t_last, device)?;
+        let model_out = self.forward_diff_step(context, x_t.clone(), t_last, device)?;
 
         if self.model_output_type == ModelOutputType::X0 {
             return Ok(model_out);

@@ -70,10 +70,6 @@ impl<B: Backend> NeighborhoodAttention3D<B> {
     }
 
     /// Norm, scale, and `RoPE` Q and K; return `(q, k, v)` for attention.
-    #[expect(
-        clippy::arithmetic_side_effects,
-        reason = "Burn tensor ops run on device; Rust host integer overflow is not possible"
-    )]
     fn qkv_with_rope(
         &self,
         x: Tensor<B, 5>,

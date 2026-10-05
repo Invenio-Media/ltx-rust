@@ -35,10 +35,6 @@ pub const fn window_start(pos: usize, length: usize, kernel: usize) -> usize {
 /// Build an additive NA mask `[N, N]` where `N = time × height × width`.
 ///
 /// `mask[i, j] = 0.0` when `j` is in the window of `i`, else `−∞`.
-#[expect(
-    clippy::many_single_char_names,
-    reason = "spatial dimension variables follow standard notation"
-)]
 fn build_na_mask<B: Backend>(
     time: usize,
     height: usize,

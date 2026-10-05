@@ -56,7 +56,6 @@ pub fn patchify<B: Backend>(
 /// # Errors
 ///
 /// Returns [`VaeDecoderError::InvalidArgument`] when C is not divisible by `p²`.
-#[expect(clippy::many_single_char_names, reason = "tensor dim variables")]
 pub fn unpatchify<B: Backend>(
     x: Tensor<B, 5>,
     patch_size_hw: usize,

@@ -22,11 +22,10 @@ pub fn inv_freqs(dim: usize, base: f64) -> Vec<f32> {
             #[expect(
                 clippy::as_conversions,
                 clippy::cast_precision_loss,
-                clippy::cast_possible_truncation,
                 reason = "freq index is small (< head_dim/2 ≤ 32); precision loss is negligible"
             )]
             let exp = (i as f64) * 2.0 / (dim as f64);
-            #[expect(
+            #[allow(
                 clippy::as_conversions,
                 clippy::cast_possible_truncation,
                 reason = "RoPE inverse frequencies fit f32 for model head dimensions"
@@ -49,7 +48,6 @@ pub fn inv_freqs(dim: usize, base: f64) -> Vec<f32> {
     clippy::indexing_slicing,
     reason = "bounds are verified by construction"
 )]
-#[expect(clippy::many_single_char_names, reason = "tensor dim variables")]
 #[expect(
     clippy::arithmetic_side_effects,
     reason = "Burn tensor ops run on device; Rust host integer overflow is not possible"
