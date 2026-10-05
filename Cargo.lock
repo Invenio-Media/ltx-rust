@@ -2685,6 +2685,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ltx-chunk"
+version = "0.1.0"
+dependencies = [
+ "ltx-shape",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ltx-shape"
 version = "0.1.0"
 dependencies = [

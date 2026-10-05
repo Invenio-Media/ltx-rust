@@ -16,6 +16,7 @@ alpha matte.
 | `ltx-shape` | Pixel and latent shape rules, IC-LoRA token counts |
 | `ltx-budget` | GPU memory budget estimation and solver (device query, quadratic fit, cache, spatial fallback) |
 | `ltx-weights` | Memory-mapped safetensors store; FP8 dequant; LoRA merging |
+| `ltx-chunk` | Temporal/spatial chunk planning, reflection padding, smoothstep blend, seam conditioning |
 
 ## Checks
 
