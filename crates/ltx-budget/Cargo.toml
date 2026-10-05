@@ -1,0 +1,33 @@
+[package]
+name = "ltx-budget"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GPU memory budget estimation and solver for LTX-2 video generation."
+
+[features]
+## Query NVIDIA GPU memory via NVML.
+nvml = ["dep:nvml-wrapper"]
+## Query Apple Silicon GPU memory via Metal (macOS only).
+metal = ["dep:objc2-metal", "dep:objc2"]
+
+[dependencies]
+ltx-shape = { path = "../ltx-shape" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+nvml-wrapper = { workspace = true, optional = true }
+
+# Platform-specific: objc2-metal only resolves on macOS, so it cannot go in
+# [workspace.dependencies] (which is target-agnostic). This is the only
+# exception to the workspace-deps rule for this crate.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-metal = { version = "0.3.2", optional = true, features = ["MTLDevice"] }
+# objc2 provides Retained and ProtocolObject, used to store the Metal device.
+objc2 = { version = "0.6", optional = true }
+
+[lints]
+workspace = true
