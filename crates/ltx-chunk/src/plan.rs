@@ -3,16 +3,17 @@
 //! Splits a clip of `total` frames into overlapping windows of `chunk_len`
 //! (which must be `8k + 1`) with an `overlap` that is a multiple of 8.
 //!
-//! The stride `S = chunk_len − overlap`. Chunks start at `0, S, 2S, …`; the
-//! last chunk is anchored to `total − chunk_len` so no padding is needed at
-//! the right edge. When `total ≤ chunk_len` a single chunk `0..total` is
+//! Candidate chunks start at `0, S, 2S, …`; the last chunk is anchored to
+//! `total − chunk_len` so no padding is needed at the right edge. If that
+//! anchored chunk would intersect the previous two chunks, the previous
+//! candidate is removed. When `total ≤ chunk_len` a single chunk `0..total` is
 //! returned (the caller is responsible for reflection-padding if `total` is
 //! not `8k + 1`).
 //!
 //! **Overlap constraint** – To keep blend weights summing to 1, the stride
 //! must be at least as long as the overlap (`stride ≥ overlap`, equivalently
-//! `chunk_len ≥ 2 × overlap`). This ensures every pixel frame belongs to at
-//! most two chunks.
+//! `chunk_len ≥ 2 × overlap`). Together with the anchored-chunk pruning above,
+//! this ensures every pixel frame belongs to at most two chunks.
 
 use crate::error::ChunkError;
 use ltx_shape::ScaleFactors;
@@ -77,7 +78,7 @@ pub fn plan(total: u32, chunk_len: u32, overlap: u32) -> Result<Vec<Chunk>, Chun
         return Err(ChunkError::OverlapNotMultipleOf8(overlap));
     }
 
-    // stride >= overlap (ensures ≤ 2 chunks per frame, blend weights sum to 1).
+    // stride >= overlap; anchored-chunk pruning below keeps ≤ 2 chunks per frame.
     let stride = chunk_len.saturating_sub(overlap);
     if stride < overlap {
         return Err(ChunkError::StrideSmallerThanOverlap { stride, overlap });
@@ -92,34 +93,72 @@ pub fn plan(total: u32, chunk_len: u32, overlap: u32) -> Result<Vec<Chunk>, Chun
         }]);
     }
 
-    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut starts: Vec<u32> = Vec::new();
     let mut start = 0_u32;
 
-    // Push all non-last chunks: each covers [start, start + chunk_len).
+    // Candidate non-last chunks each cover [start, start + chunk_len).
     loop {
         let end = start.saturating_add(chunk_len);
         if end >= total {
             break;
         }
-        let real_overlap = if chunks.is_empty() { 0 } else { overlap };
-        chunks.push(Chunk {
-            start,
-            end,
-            real_overlap,
-        });
+        starts.push(start);
         start = start.saturating_add(stride);
     }
 
     // Anchored last chunk: always ends exactly at `total`.
     let last_start = total.saturating_sub(chunk_len);
-    let real_overlap = chunks
-        .last()
-        .map_or(0, |c| c.end.saturating_sub(last_start));
-    chunks.push(Chunk {
-        start: last_start,
-        end: total,
-        real_overlap,
-    });
+    if starts.last().copied() != Some(last_start) {
+        starts.push(last_start);
+    }
+
+    // If the anchored last chunk starts before the chunk two positions back
+    // ends, the middle chunk would create a three-chunk overlap. Remove that
+    // middle candidate; coverage is preserved because the final chunk still
+    // overlaps the earlier chunk.
+    while starts.len() >= 3 {
+        let final_idx = starts.len().saturating_sub(1);
+        let Some(&before_previous) = starts.get(final_idx.saturating_sub(2)) else {
+            break;
+        };
+        let Some(&final_start) = starts.get(final_idx) else {
+            break;
+        };
+        if final_start < before_previous.saturating_add(chunk_len) {
+            starts.remove(final_idx.saturating_sub(1));
+        } else {
+            break;
+        }
+    }
+
+    let chunks = starts
+        .iter()
+        .enumerate()
+        .map(|(idx, &chunk_start)| {
+            let end = if idx == starts.len().saturating_sub(1) {
+                total
+            } else {
+                chunk_start.saturating_add(chunk_len)
+            };
+            let real_overlap = if idx == 0 {
+                0
+            } else {
+                starts
+                    .get(idx.saturating_sub(1))
+                    .map_or(0, |previous_start| {
+                        previous_start
+                            .saturating_add(chunk_len)
+                            .min(total)
+                            .saturating_sub(chunk_start)
+                    })
+            };
+            Chunk {
+                start: chunk_start,
+                end,
+                real_overlap,
+            }
+        })
+        .collect();
 
     Ok(chunks)
 }
@@ -144,6 +183,17 @@ mod tests {
             assert!(
                 chunks.iter().any(|c| c.start <= f && f < c.end),
                 "frame {f} not covered"
+            );
+        }
+    }
+
+    /// Every frame 0..total appears in at most two chunks.
+    fn assert_at_most_two_chunks_per_frame(chunks: &[Chunk], total: u32) {
+        for f in 0..total {
+            let covering = chunks.iter().filter(|c| c.start <= f && f < c.end).count();
+            assert!(
+                covering <= 2,
+                "frame {f} covered by {covering} chunks: {chunks:?}"
             );
         }
     }
@@ -275,6 +325,57 @@ mod tests {
     }
 
     #[test]
+    fn anchored_last_prunes_three_chunk_overlap() {
+        let chunks = plan(28, 17, 8).unwrap();
+        assert_eq!(
+            chunks,
+            vec![
+                Chunk {
+                    start: 0,
+                    end: 17,
+                    real_overlap: 0,
+                },
+                Chunk {
+                    start: 11,
+                    end: 28,
+                    real_overlap: 6,
+                },
+            ]
+        );
+        assert_all_frames_covered(&chunks, 28);
+        assert_at_most_two_chunks_per_frame(&chunks, 28);
+        assert_starts_monotonic(&chunks);
+    }
+
+    #[test]
+    fn anchored_last_keeps_earlier_non_intersecting_chunk() {
+        let chunks = plan(40, 17, 8).unwrap();
+        assert_eq!(
+            chunks,
+            vec![
+                Chunk {
+                    start: 0,
+                    end: 17,
+                    real_overlap: 0,
+                },
+                Chunk {
+                    start: 9,
+                    end: 26,
+                    real_overlap: 8,
+                },
+                Chunk {
+                    start: 23,
+                    end: 40,
+                    real_overlap: 3,
+                },
+            ]
+        );
+        assert_all_frames_covered(&chunks, 40);
+        assert_at_most_two_chunks_per_frame(&chunks, 40);
+        assert_starts_monotonic(&chunks);
+    }
+
+    #[test]
     fn many_chunks_full_coverage() {
         // chunk_len=33, overlap=8, stride=25
         let (total, chunk_len, overlap) = (200_u32, 33_u32, 8_u32);
@@ -314,10 +415,13 @@ mod tests {
     }
 
     #[test]
-    fn first_chunk_zero_overlap_second_chunk_nominal() {
+    fn first_chunk_zero_overlap_second_chunk_can_be_less_than_nominal_after_prune() {
         let chunks = plan(60, 33, 8).unwrap();
+        assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].real_overlap, 0);
-        assert_eq!(chunks[1].real_overlap, 8);
+        assert_eq!(chunks[1].real_overlap, 6);
+        assert_all_frames_covered(&chunks, 60);
+        assert_at_most_two_chunks_per_frame(&chunks, 60);
     }
 
     #[test]
