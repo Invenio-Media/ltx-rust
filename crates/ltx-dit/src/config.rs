@@ -173,6 +173,100 @@ impl DiTConfig {
     ///
     /// Returns [`DitError::Json`] when the JSON is malformed.
     pub fn from_json(value: &serde_json::Value) -> Result<Self, DitError> {
-        Ok(serde_json::from_value(value.clone())?)
+        let config: Self = serde_json::from_value(value.clone())?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate architectural constraints that would otherwise panic in tensor reshapes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DitError::Config`] when unsupported flags or incompatible
+    /// dimensions are present.
+    pub fn validate(&self) -> Result<(), DitError> {
+        if self.num_attention_heads == 0 {
+            return Err(DitError::Config("num_attention_heads must be > 0".into()));
+        }
+        if !self.attention_head_dim.is_multiple_of(2) {
+            return Err(DitError::Config(
+                "attention_head_dim must be even for RoPE".into(),
+            ));
+        }
+        let inner = self.inner_dim();
+        let n_pos = self.positional_embedding_max_pos.len();
+        let rope_pair_dims = n_pos
+            .checked_mul(2)
+            .ok_or_else(|| DitError::Config("positional embedding dimension overflow".into()))?;
+        if inner < rope_pair_dims {
+            return Err(DitError::Config(format!(
+                "inner_dim {inner} must be at least 2 * positional dimensions {rope_pair_dims}"
+            )));
+        }
+        let half = inner
+            .checked_div(2)
+            .ok_or_else(|| DitError::Config("inner_dim division overflow".into()))?;
+        if !half.is_multiple_of(self.num_attention_heads) {
+            return Err(DitError::Config(format!(
+                "inner_dim / 2 ({half}) must be divisible by num_attention_heads {}",
+                self.num_attention_heads
+            )));
+        }
+        if self.flags.cross_attention_adaln && self.flags.use_prompt_adaln_single {
+            return Err(DitError::Config(
+                "use_prompt_adaln_single with cross_attention_adaln is not wired in this core"
+                    .into(),
+            ));
+        }
+        if self.flags.use_keyframes_abs_pos_embedding {
+            return Err(DitError::Config(
+                "use_keyframes_abs_pos_embedding is not wired in this core".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_validates() {
+        DiTConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_unsupported_model_level_flags() {
+        let mut config = DiTConfig::default();
+        config.flags.cross_attention_adaln = true;
+        config.flags.use_prompt_adaln_single = true;
+        assert!(config.validate().is_err());
+
+        let mut config = DiTConfig::default();
+        config.flags.use_keyframes_abs_pos_embedding = true;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_rope_shape_hazards() {
+        let mut config = DiTConfig {
+            num_attention_heads: 0,
+            ..DiTConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config = DiTConfig {
+            attention_head_dim: 127,
+            ..DiTConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config = DiTConfig {
+            num_attention_heads: 1,
+            attention_head_dim: 4,
+            ..DiTConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 }

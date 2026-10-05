@@ -113,7 +113,12 @@ impl<B: Backend> VideoTransformer<B> {
     /// Weights loaded from a checkpoint should be assigned via the standard
     /// Burn record API (`module.load_record(record)`) or the fixture loader in
     /// the parity test.
-    pub fn new(config: &DiTConfig, device: &B::Device) -> Self {
+    ///
+    /// # Errors
+    /// Returns [`crate::DitError::Config`] when the config has unsupported flags
+    /// or incompatible dimensions.
+    pub fn new(config: &DiTConfig, device: &B::Device) -> Result<Self, crate::DitError> {
+        config.validate()?;
         let inner = config.inner_dim();
 
         let blocks: Vec<_> = (0..config.num_layers)
@@ -125,14 +130,14 @@ impl<B: Backend> VideoTransformer<B> {
         // does not wire those model-level paths yet. Do not allocate parameters
         // that `forward` would not read.
 
-        Self {
+        Ok(Self {
             patchify_proj: LinearConfig::new(config.in_channels, inner).init(device),
             adaln_single: AdaLayerNormSingle::new(inner, config.adaln_coeff(), device),
             scale_shift_table: Param::from_tensor(Tensor::zeros([2, inner], device)),
             proj_out: LinearConfig::new(inner, config.out_channels).init(device),
             blocks,
             config: config.clone(),
-        }
+        })
     }
 
     /// Enable chunked self-attention on all blocks.

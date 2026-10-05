@@ -8,7 +8,7 @@
 //!
 //! let device = Default::default();
 //! let config = DiTConfig::default();
-//! let model: VideoTransformer<NdArray> = VideoTransformer::new(&config, &device);
+//! let model: VideoTransformer<NdArray> = VideoTransformer::new(&config, &device).unwrap();
 //! ```
 //!
 //! # Crate features
