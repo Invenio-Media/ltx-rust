@@ -29,7 +29,8 @@ pub struct DiTFlags {
     pub apply_gated_attention: bool,
     /// Use AdaLN for the cross-attention query/key/value projections.
     pub cross_attention_adaln: bool,
-    /// Include a second AdaLN MLP for the prompt (cross-attention K/V).
+    /// Include a second AdaLN MLP for prompt conditioning when
+    /// `cross_attention_adaln` is enabled; ignored otherwise.
     pub use_prompt_adaln_single: bool,
     /// Whether the feed-forward layers have a bias term.
     pub ff_bias: bool,
@@ -212,6 +213,9 @@ impl DiTConfig {
                 self.num_attention_heads
             )));
         }
+        // `use_prompt_adaln_single` only allocates a model-level path when
+        // cross-attention AdaLN is enabled. The default config keeps it true for
+        // metadata parity, but with `cross_attention_adaln = false` it is inert.
         if self.flags.cross_attention_adaln && self.flags.use_prompt_adaln_single {
             return Err(DitError::Config(
                 "use_prompt_adaln_single with cross_attention_adaln is not wired in this core"

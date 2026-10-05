@@ -111,8 +111,8 @@ impl<B: Backend> VideoTransformer<B> {
     /// Build a randomly-initialised transformer from a config.
     ///
     /// Weights loaded from a checkpoint should be assigned via the standard
-    /// Burn record API (`module.load_record(record)`) or the fixture loader in
-    /// the parity test.
+    /// Burn record API (`module.load_record(record)`) or a project-specific
+    /// fixture loader.
     ///
     /// # Errors
     /// Returns [`crate::DitError::Config`] when the config has unsupported flags

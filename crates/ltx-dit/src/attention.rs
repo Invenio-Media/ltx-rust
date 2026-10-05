@@ -235,10 +235,9 @@ fn sdp_attention<B: Backend>(
 
 /// Chunked scaled dot-product attention.
 ///
-/// Splits Q into `ceil(T_q / chunk_size)` chunks.  Each chunk computes
-/// attention against the full K and V.  Because the softmax is per-row and K/V
-/// are not chunked, the output is **bit-for-bit identical** to the full-matrix
-/// path — no numerical difference.
+/// Splits Q into `ceil(T_q / chunk_size)` chunks. Each chunk computes attention
+/// against the full K and V. Because the softmax is per-row and K/V are not
+/// chunked, the output is mathematically identical to the full-matrix path.
 ///
 /// Peak device memory: `O(B × H × chunk_size × T_k)` instead of
 /// `O(B × H × T_q × T_k)`.
