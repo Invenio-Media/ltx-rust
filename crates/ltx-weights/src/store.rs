@@ -176,14 +176,12 @@ impl WeightStore {
         let all_keys: Vec<String> = entries.keys().cloned().collect();
         let mut scale_keys: HashSet<String> = HashSet::new();
         for k in &all_keys {
-            if k.ends_with("_scale") {
-                let param_key = k.trim_end_matches("_scale");
-                if entries
+            if let Some(param_key) = k.strip_suffix("_scale")
+                && entries
                     .get(param_key)
                     .is_some_and(|entry| is_fp8(entry.dtype))
-                {
-                    scale_keys.insert(k.clone());
-                }
+            {
+                scale_keys.insert(k.clone());
             }
         }
 
@@ -250,11 +248,11 @@ impl WeightStore {
                 continue;
             };
 
-            let (shape, dtype) = {
+            let dtype = {
                 let Some(entry) = self.entries.get(&param_key) else {
                     continue;
                 };
-                (entry.shape.clone(), entry.dtype)
+                entry.dtype
             };
             let raw = self
                 .entries
@@ -264,11 +262,20 @@ impl WeightStore {
             let nbytes = raw.len();
 
             let mut f32_data = decode_to_f32(&raw, dtype, nbytes)?;
-            let ndim = shape.len();
-            if ndim >= 1 {
-                for val in &mut f32_data {
-                    *val = gate_val.mul_add(*val, 0.0_f32);
+            if is_fp8(dtype) {
+                let scale_key = format!("{param_key}_scale");
+                if let Some(scale_entry) = self.entries.get(&scale_key) {
+                    let scale_raw = scale_entry.read_raw(&scale_key, &self.files)?;
+                    let scale = decode_scalar_f32(&scale_raw, scale_entry.dtype)?;
+                    for value in &mut f32_data {
+                        *value *= scale;
+                    }
                 }
+                self.entries.remove(&scale_key);
+                self.scale_keys.remove(&scale_key);
+            }
+            for val in &mut f32_data {
+                *val *= gate_val;
             }
             let new_bytes = f32_slice_to_bytes(&f32_data);
             if let Some(e) = self.entries.get_mut(&param_key) {

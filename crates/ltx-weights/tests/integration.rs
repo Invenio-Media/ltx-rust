@@ -365,6 +365,35 @@ fn video_decoder_gate_fold() {
     assert!((folded_b.data[1] - 3.0).abs() < 1e-6);
 }
 
+#[test]
+fn gate_fold_applies_fp8_scale_before_folding() {
+    let gate_bytes = f32_bytes(&[2.0f32]);
+    let scale_bytes = f32_bytes(&[4.0f32]);
+    let sft = make_safetensors(
+        None,
+        &[
+            ("vae.decoder.blocks.0.gate_msa", &[1], "F32", &gate_bytes),
+            (
+                "vae.decoder.blocks.0.attn.proj.weight",
+                &[1],
+                "F8_E4M3",
+                &[0x38u8],
+            ),
+            (
+                "vae.decoder.blocks.0.attn.proj.weight_scale",
+                &[1],
+                "F32",
+                &scale_bytes,
+            ),
+        ],
+    );
+    let (_tmp, path) = write_tmp(&sft);
+
+    let store = WeightStore::open(&[&path], &KeyMap::video_decoder()).unwrap();
+    assert!(!store.contains("blocks.0.attn.proj.weight_scale"));
+    assert_eq!(store.read("blocks.0.attn.proj.weight").unwrap().data, [8.0]);
+}
+
 // ─── FP8 dequantization ───────────────────────────────────────────────────────
 
 #[test]
