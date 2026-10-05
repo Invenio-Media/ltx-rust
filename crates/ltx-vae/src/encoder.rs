@@ -242,14 +242,17 @@ impl<B: Backend> VideoEncoder<B> {
     /// Encode using temporal tiles to bound memory use.
     ///
     /// When `tile_frames` is `None`, the entire clip is encoded in one pass.
-    /// When provided, the clip is split into overlapping temporal tiles blended
-    /// with a trapezoidal weight mask.
-    ///
+    /// When provided, only temporal tiling is used: the clip is split into
+    /// overlapping temporal tiles blended with a trapezoidal weight mask.
+    /// `tile_frames` must satisfy `1 + k * temporal_factor`, and
+    /// `tile_frames - tile_overlap` must be a multiple of `temporal_factor` so
+    /// every tile starts on the latent temporal grid.
     /// Input:  `(B, C, F, H, W)`.
     /// Output: `(B, latent_channels, F', H', W')`.
     ///
     /// # Errors
-    /// Propagates errors from [`encode`](Self::encode).
+    /// Returns [`VaeError::Config`] for zero, fully-overlapped, or temporally
+    /// misaligned tile settings. Propagates errors from [`encode`](Self::encode).
     pub fn tiled_encode(
         &self,
         video: Tensor<B, 5>,
@@ -260,6 +263,8 @@ impl<B: Backend> VideoEncoder<B> {
             return self.encode(video);
         };
 
+        validate_tile_args(tile_frames, tile_overlap, self.temporal_factor)?;
+
         let [nb, _nc, f_total, nh, nw] = video.dims();
         let tf = self.temporal_factor;
         let f_valid = valid_frame_count(f_total, tf);
@@ -269,6 +274,10 @@ impl<B: Backend> VideoEncoder<B> {
             video
         };
 
+        if tile_frames >= f_valid {
+            return self.encode(video);
+        }
+
         let output_shape = self.compute_output_shape(nb, f_valid, nh, nw, tf)?;
         let (f_out, h_out, w_out) = output_shape;
         let lc = self.latent_channels;
@@ -277,7 +286,7 @@ impl<B: Backend> VideoEncoder<B> {
         let mut latent_buf: Tensor<B, 5> = Tensor::zeros([nb, lc, f_out, h_out, w_out], &device);
         let mut weight_buf: Tensor<B, 5> = Tensor::zeros([nb, lc, f_out, h_out, w_out], &device);
 
-        let step = tile_frames.saturating_sub(tile_overlap).max(1);
+        let step = tile_frames.saturating_sub(tile_overlap);
         let mut start = 0_usize;
 
         loop {
@@ -645,14 +654,18 @@ fn trapezoidal_mask_1d<B: Backend>(
 ///
 /// All values in `[0.0, 1.0]`.
 ///
-/// Uses `u16::try_from` to avoid `as_conversions`.  Loop indices are bounded
-/// by tile sizes (<<65535), so the `unwrap_or(u16::MAX)` fallback never fires
-/// in practice.
+/// Uses a direct integer-to-float cast. Tile lengths are far below the range
+/// where `usize` cannot be exactly represented as `f32` in normal use, and the
+/// mask is only a blend weight.
 fn ramp_value(i: usize, n: usize, ramp_left: usize, ramp_right: usize) -> f32 {
-    /// `usize → f32` without `as`: safe for values < 65536 (all tile-size indices).
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "tile-mask indices are small and only become blend weights"
+    )]
     #[inline]
-    fn to_f32(v: usize) -> f32 {
-        f32::from(u16::try_from(v).unwrap_or(u16::MAX))
+    const fn to_f32(v: usize) -> f32 {
+        v as f32
     }
     if ramp_left > 0 && i < ramp_left {
         to_f32(i.saturating_add(1)) / to_f32(ramp_left.saturating_add(1))
@@ -662,6 +675,35 @@ fn ramp_value(i: usize, n: usize, ramp_left: usize, ramp_right: usize) -> f32 {
     } else {
         1.0_f32
     }
+}
+
+fn validate_tile_args(
+    tile_frames: usize,
+    tile_overlap: usize,
+    temporal_factor: usize,
+) -> Result<(), VaeError> {
+    if tile_frames == 0 {
+        return Err(VaeError::Config(
+            "tile_frames must be greater than zero".into(),
+        ));
+    }
+    if tile_overlap >= tile_frames {
+        return Err(VaeError::Config(
+            "tile_overlap must be smaller than tile_frames".into(),
+        ));
+    }
+    if temporal_factor > 0 && valid_frame_count(tile_frames, temporal_factor) != tile_frames {
+        return Err(VaeError::Config(format!(
+            "tile_frames {tile_frames} must be 1 + k*{temporal_factor}"
+        )));
+    }
+    let step = tile_frames.saturating_sub(tile_overlap);
+    if temporal_factor > 0 && !step.is_multiple_of(temporal_factor) {
+        return Err(VaeError::Config(format!(
+            "tile_frames - tile_overlap ({step}) must be a multiple of temporal_factor {temporal_factor}"
+        )));
+    }
+    Ok(())
 }
 
 /// Replace `buf` along dim 2 from `l_start` to `l_end` (exclusive) with `patch`.
@@ -682,4 +724,29 @@ fn splice_dim2<B: Backend>(
         parts.push(buf.narrow(2, l_end, len));
     }
     Tensor::cat(parts, 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tile_args_reject_degenerate_values() {
+        assert!(validate_tile_args(0, 0, 8).is_err());
+        assert!(validate_tile_args(17, 17, 8).is_err());
+        assert!(validate_tile_args(17, 18, 8).is_err());
+    }
+
+    #[test]
+    fn tile_args_require_grid_aligned_step() {
+        assert!(validate_tile_args(17, 8, 8).is_err());
+        assert!(validate_tile_args(17, 9, 8).is_ok());
+        assert!(validate_tile_args(25, 9, 8).is_ok());
+    }
+
+    #[test]
+    fn ramp_value_does_not_saturate_large_lengths() {
+        let value = ramp_value(69_999, 70_000, 70_000, 0);
+        assert!(value > 0.99_f32, "unexpected ramp value {value}");
+    }
 }
