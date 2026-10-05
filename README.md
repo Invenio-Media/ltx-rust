@@ -17,6 +17,8 @@ alpha matte.
 | `ltx-budget` | GPU memory budget estimation and solver (device query, quadratic fit, cache, spatial fallback) |
 | `ltx-weights` | Memory-mapped safetensors store; FP8 dequant; LoRA merging |
 | `ltx-chunk` | Temporal/spatial chunk planning, reflection padding, smoothstep blend, seam conditioning |
+| `ltx-io` | ffprobe metadata, ffmpeg frame decode, EXR matte write, preview encode |
+| `ltx-backend` | `AlphaBackend` trait and Python backend (JSON-lines over stdio) |
 
 ## Checks
 
