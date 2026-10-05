@@ -149,27 +149,17 @@ pub fn head_tail_param_count(c: &DiTConfig) -> u64 {
         .saturating_mul(inner.saturating_mul(inner))
         .saturating_add(coeff.saturating_mul(inner));
 
-    // prompt_adaln_single (optional)
-    let prompt_adaln = if c.flags.cross_attention_adaln && c.flags.use_prompt_adaln_single {
-        // same l1 + l2 + proj(inner→2×inner)
-        adaln_l1
-            .saturating_add(adaln_l2)
-            .saturating_add(2u64.saturating_mul(inner.saturating_mul(inner)))
-            .saturating_add(2u64.saturating_mul(inner))
-    } else {
-        0
-    };
+    // Model-level prompt AdaLN is parsed from metadata but not allocated in this
+    // video-only core until its forward path is implemented.
+    let prompt_adaln = 0;
 
     // output: scale_shift_table(2×inner) + proj_out(inner→out_channels, bias)
     let out_sst = 2u64.saturating_mul(inner);
     let proj_out = inner.saturating_mul(out_ch).saturating_add(out_ch);
 
-    // Optional keyframe embedding (1 × inner)
-    let kfe = if c.flags.use_keyframes_abs_pos_embedding {
-        inner
-    } else {
-        0
-    };
+    // Keyframe absolute-position metadata is parsed but not allocated until its
+    // forward path is implemented.
+    let kfe = 0;
 
     patch
         .saturating_add(adaln_l1)

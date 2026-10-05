@@ -46,6 +46,7 @@ pub fn precompute_freqs_cis<B: Backend>(
     max_pos: &[usize; 3],
     num_heads: usize,
     rope_type: RopeType,
+    use_middle_indices_grid: bool,
     device: &B::Device,
 ) -> (Tensor<B, 4>, Tensor<B, 4>) {
     let [batch, n_pos, n_tokens, _two] = positions.dims();
@@ -58,7 +59,7 @@ pub fn precompute_freqs_cis<B: Backend>(
     let freq_vec = make_freq_grid(theta, grid_size);
     let freq_1d = Tensor::<B, 1>::from_floats(freq_vec.as_slice(), device); // (grid_size,)
 
-    // --- midpoint positions ---------------------------------------------------
+    // --- normalized positions -------------------------------------------------
     let pos_start = positions
         .clone()
         .narrow(3, 0, 1)
@@ -68,13 +69,26 @@ pub fn precompute_freqs_cis<B: Backend>(
     // max_pos tensor (1, n_pos, 1) for broadcasting.
     let max_pos_vec: Vec<f32> = max_pos
         .iter()
-        .map(|&m| f32::from(u16::try_from(m).unwrap_or(u16::MAX)))
+        .map(|&m| {
+            #[expect(
+                clippy::as_conversions,
+                clippy::cast_precision_loss,
+                reason = "position bounds become RoPE normalization denominators"
+            )]
+            {
+                m as f32
+            }
+        })
         .collect();
     let max_pos_t =
         Tensor::<B, 1>::from_floats(max_pos_vec.as_slice(), device).reshape([1, n_pos, 1]);
 
-    // Fractional midpoint in [0, 1].
-    let frac = (pos_start + pos_end).div_scalar(2.0_f32) / max_pos_t;
+    // Fractional position in [0, 1].
+    let frac = if use_middle_indices_grid {
+        (pos_start + pos_end).div_scalar(2.0_f32) / max_pos_t
+    } else {
+        pos_start / max_pos_t
+    };
 
     // Map to [-1, 1].
     let frac_mapped = frac.mul_scalar(2.0_f32).add_scalar(-1.0_f32);

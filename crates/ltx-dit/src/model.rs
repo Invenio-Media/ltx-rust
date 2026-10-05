@@ -97,10 +97,6 @@ pub struct VideoTransformer<B: Backend> {
     pub patchify_proj: Linear<B>,
     /// Per-token timestep → AdaLN modulation + embedded timestep.
     pub adaln_single: AdaLayerNormSingle<B>,
-    /// Optional prompt-side AdaLN (used when `cross_attention_adaln = true`).
-    pub prompt_adaln_single: Option<AdaLayerNormSingle<B>>,
-    /// Learnable keyframe absolute-position marker (optional).
-    pub keyframes_abs_pos_embedding: Option<Param<Tensor<B, 2>>>,
     /// Static output-norm scale-shift: `(2, inner_dim)`.
     pub scale_shift_table: Param<Tensor<B, 2>>,
     /// Output linear: `inner_dim → out_channels`.
@@ -124,24 +120,14 @@ impl<B: Backend> VideoTransformer<B> {
             .map(|_| TransformerBlock::new(config, device))
             .collect();
 
-        let prompt_adaln =
-            if config.flags.cross_attention_adaln && config.flags.use_prompt_adaln_single {
-                Some(AdaLayerNormSingle::new(inner, 2, device))
-            } else {
-                None
-            };
-
-        let keyframes = if config.flags.use_keyframes_abs_pos_embedding {
-            Some(Param::from_tensor(Tensor::zeros([1, inner], device)))
-        } else {
-            None
-        };
+        // `use_prompt_adaln_single` and `use_keyframes_abs_pos_embedding` are
+        // parsed for checkpoint metadata compatibility, but this video-only core
+        // does not wire those model-level paths yet. Do not allocate parameters
+        // that `forward` would not read.
 
         Self {
             patchify_proj: LinearConfig::new(config.in_channels, inner).init(device),
             adaln_single: AdaLayerNormSingle::new(inner, config.adaln_coeff(), device),
-            prompt_adaln_single: prompt_adaln,
-            keyframes_abs_pos_embedding: keyframes,
             scale_shift_table: Param::from_tensor(Tensor::zeros([2, inner], device)),
             proj_out: LinearConfig::new(inner, config.out_channels).init(device),
             blocks,
@@ -193,8 +179,12 @@ impl<B: Backend> VideoTransformer<B> {
 
         // ── Timestep embedding ─────────────────────────────────────────────
         // Scale by timestep_scale_multiplier (default 1000).
-        let ts_scale =
-            f32::from(u16::try_from(self.config.timestep_scale_multiplier).unwrap_or(u16::MAX));
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_precision_loss,
+            reason = "timestep scale is a model hyperparameter consumed as f32"
+        )]
+        let ts_scale = self.config.timestep_scale_multiplier as f32;
         let ts_flat = timesteps
             .mul_scalar(ts_scale)
             .reshape([batch.saturating_mul(n_tokens)]);
@@ -214,6 +204,7 @@ impl<B: Backend> VideoTransformer<B> {
             &self.config.positional_embedding_max_pos,
             self.config.num_attention_heads,
             self.config.rope_type,
+            self.config.use_middle_indices_grid,
             device,
         );
 
