@@ -105,10 +105,6 @@ impl<B: Backend> AttnBlock3D<B> {
     ///
     /// # Errors
     /// Returns [`VaeError::DimOverflow`] on shape arithmetic overflow.
-    #[expect(
-        clippy::many_single_char_names,
-        reason = "b/c/t/h/w are standard tensor shape names"
-    )]
     pub fn forward(&self, x: Tensor<B, 5>) -> Result<Tensor<B, 5>, VaeError> {
         let [nb, nc, nt, nh, nw] = x.dims();
         let hw = nh.checked_mul(nw).ok_or(VaeError::DimOverflow)?;

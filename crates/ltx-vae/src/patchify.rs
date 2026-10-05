@@ -21,7 +21,7 @@
 //! 5-D tensor `(B·C·F, h_out, q, w_out, r)`:
 //! 1. `swap_dims(1, 4)` → `(B·C·F, r, q, w_out, h_out)`
 //! 2. `swap_dims(3, 4)` → `(B·C·F, r, q, h_out, w_out)`
-//! Then reshape to `(B, C·r·q, F, h_out, w_out)`.
+//!    Then reshape to `(B, C·r·q, F, h_out, w_out)`.
 
 use burn::tensor::{Tensor, backend::Backend};
 

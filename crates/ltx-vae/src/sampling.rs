@@ -157,10 +157,6 @@ fn pixel_shuffle_5d<B: Backend>(
 }
 
 /// `(B, C, F*st, H, W)` → `(B, C*st, F, H, W)`.
-#[expect(
-    clippy::many_single_char_names,
-    reason = "b/c/f/h/w are standard tensor shape names"
-)]
 fn fold_temporal<B: Backend>(x: Tensor<B, 5>, stride_t: usize) -> Result<Tensor<B, 5>, VaeError> {
     let [nb, nc, f_in, nh, nw] = x.dims();
     let f_out = f_in.checked_div(stride_t).ok_or(VaeError::DimOverflow)?;
@@ -179,10 +175,6 @@ fn fold_temporal<B: Backend>(x: Tensor<B, 5>, stride_t: usize) -> Result<Tensor<
 }
 
 /// `(B, C, F, H*sh, W)` → `(B, C*sh, F, H, W)`.
-#[expect(
-    clippy::many_single_char_names,
-    reason = "b/c/f/h/w are standard tensor shape names"
-)]
 fn fold_height<B: Backend>(x: Tensor<B, 5>, stride_h: usize) -> Result<Tensor<B, 5>, VaeError> {
     let [nb, nc, nf, h_in, nw] = x.dims();
     let h_out = h_in.checked_div(stride_h).ok_or(VaeError::DimOverflow)?;
@@ -201,10 +193,6 @@ fn fold_height<B: Backend>(x: Tensor<B, 5>, stride_h: usize) -> Result<Tensor<B,
 }
 
 /// `(B, C, F, H, W*sw)` → `(B, C*sw, F, H, W)`.
-#[expect(
-    clippy::many_single_char_names,
-    reason = "b/c/f/h/w are standard tensor shape names"
-)]
 fn fold_width<B: Backend>(x: Tensor<B, 5>, stride_w: usize) -> Result<Tensor<B, 5>, VaeError> {
     let [nb, nc, nf, nh, w_in] = x.dims();
     let w_out = w_in.checked_div(stride_w).ok_or(VaeError::DimOverflow)?;
@@ -228,10 +216,6 @@ fn fold_width<B: Backend>(x: Tensor<B, 5>, stride_w: usize) -> Result<Tensor<B, 
 /// Average groups of `group_size` consecutive channels.
 ///
 /// `(B, C*g, F, H, W)` → `(B, C, F, H, W)`.
-#[expect(
-    clippy::many_single_char_names,
-    reason = "b/c/f/h/w are standard tensor shape names"
-)]
 fn channel_avg<B: Backend>(x: Tensor<B, 5>, group_size: usize) -> Result<Tensor<B, 5>, VaeError> {
     if group_size == 1 {
         return Ok(x);

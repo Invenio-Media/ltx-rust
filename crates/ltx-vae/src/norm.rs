@@ -53,6 +53,10 @@ impl Default for PixelNorm {
 // ── NormLayer ─────────────────────────────────────────────────────────────────
 
 /// Selects between `GroupNorm` and `PixelNorm` for the encoder.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "boxing the Burn module would add avoidable allocation and indirection"
+)]
 #[derive(Module, Debug)]
 pub enum NormLayer<B: Backend> {
     /// Group normalisation with learnable affine transform.
