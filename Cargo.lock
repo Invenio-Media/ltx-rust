@@ -3243,7 +3243,6 @@ name = "ltx-vae-decoder"
 version = "0.1.0"
 dependencies = [
  "burn",
- "bytemuck",
  "half",
  "ltx-shape",
  "safetensors 0.8.0",

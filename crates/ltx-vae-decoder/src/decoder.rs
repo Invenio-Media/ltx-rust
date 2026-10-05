@@ -128,6 +128,10 @@ pub struct DiffusionVideoDecoder<B: Backend> {
 // ─── Forward pass ─────────────────────────────────────────────────────────────
 
 impl<B: Backend> DiffusionVideoDecoder<B> {
+    const fn pixel_time_scale(&self) -> usize {
+        self.time_scale.saturating_mul(self.up4_stride[0])
+    }
+
     /// Decode a latent tensor with pre-generated noise.
     ///
     /// `latent`: channels-first `[B, C_lat, F_l, H_l, W_l]`.
@@ -150,7 +154,7 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
         // Pixel content extents (for final crop).
         let pixel_f = f_l
             .saturating_sub(1)
-            .saturating_mul(self.time_scale)
+            .saturating_mul(self.pixel_time_scale())
             .saturating_add(1);
         let pixel_h = h_l.saturating_mul(32);
         let pixel_w = w_l.saturating_mul(32);
@@ -241,8 +245,13 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
             x = blk.forward(x, device);
         }
         x = self.up4.forward(x, drop_leading);
-        // Ghost crop: crop back the NATTEN ghost frames from the upsampled context.
-        crop_trailing_context(x, self.natten_trailing_pad, 1, self.stage5_kernel_t)
+        // Ghost crop: crop back latent-space ghost frames after all temporal upsamples.
+        crop_trailing_context(
+            x,
+            self.natten_trailing_pad,
+            self.pixel_time_scale(),
+            self.stage5_kernel_t,
+        )
     }
 
     // ── One diffusion step ────────────────────────────────────────────────
@@ -429,10 +438,20 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
         let p = |s: &str| format!("{prefix}{s}");
 
         // ── per_channel_stats ─────────────────────────────────────────────
-        let std_of_means = load_1d(st, &p("per_channel_statistics.std-of-means"), device)
-            .unwrap_or_else(|_| Tensor::ones([config.in_channels], device));
-        let mean_of_means = load_1d(st, &p("per_channel_statistics.mean-of-means"), device)
-            .unwrap_or_else(|_| Tensor::zeros([config.in_channels], device));
+        let std_of_means = load_optional_1d(
+            st,
+            &p("per_channel_statistics.std-of-means"),
+            config.in_channels,
+            device,
+            || Tensor::ones([config.in_channels], device),
+        )?;
+        let mean_of_means = load_optional_1d(
+            st,
+            &p("per_channel_statistics.mean-of-means"),
+            config.in_channels,
+            device,
+            || Tensor::zeros([config.in_channels], device),
+        )?;
         let per_channel_stats = PerChannelStatistics {
             std_of_means,
             mean_of_means,
@@ -581,6 +600,31 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
 }
 
 // ─── Weight-loading helpers ───────────────────────────────────────────────────
+
+fn load_optional_1d<B: Backend>(
+    st: &SafeTensors<'_>,
+    key: &str,
+    expected_len: usize,
+    device: &B::Device,
+    fallback: impl FnOnce() -> Tensor<B, 1>,
+) -> Result<Tensor<B, 1>, VaeDecoderError> {
+    match load_1d(st, key, device) {
+        Ok(tensor) => {
+            let [actual_len] = tensor.dims();
+            if actual_len == expected_len {
+                Ok(tensor)
+            } else {
+                Err(VaeDecoderError::ShapeMismatch {
+                    key: key.to_owned(),
+                    expected: vec![expected_len],
+                    actual: vec![actual_len],
+                })
+            }
+        }
+        Err(VaeDecoderError::KeyNotFound { .. }) => Ok(fallback()),
+        Err(err) => Err(err),
+    }
+}
 
 fn build_linear<B: Backend>(
     st: &SafeTensors<'_>,

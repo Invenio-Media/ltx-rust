@@ -17,6 +17,81 @@ use safetensors::SafeTensors;
 
 use crate::error::VaeDecoderError;
 
+fn checked_element_count(key: &str, shape: &[usize]) -> Result<usize, VaeDecoderError> {
+    shape.iter().try_fold(1_usize, |count, dim| {
+        count
+            .checked_mul(*dim)
+            .ok_or_else(|| VaeDecoderError::NumericOverflow {
+                detail: format!("element count overflow for key {key} shape {shape:?}"),
+            })
+    })
+}
+
+fn check_byte_len(
+    key: &str,
+    shape: &[usize],
+    raw_len: usize,
+    element_size: usize,
+) -> Result<(), VaeDecoderError> {
+    let expected = checked_element_count(key, shape)?
+        .checked_mul(element_size)
+        .ok_or_else(|| VaeDecoderError::NumericOverflow {
+            detail: format!(
+                "byte count overflow for key {key} shape {shape:?} element_size {element_size}"
+            ),
+        })?;
+    if raw_len != expected {
+        return Err(VaeDecoderError::InvalidArgument {
+            detail: format!(
+                "byte length mismatch for {key}: shape {shape:?} with element size {element_size} needs {expected} bytes, got {raw_len}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn f32_values_from_le_bytes(
+    key: &str,
+    shape: &[usize],
+    raw: &[u8],
+) -> Result<Vec<f32>, VaeDecoderError> {
+    check_byte_len(key, shape, raw.len(), 4)?;
+    let (chunks, remainder) = raw.as_chunks::<4>();
+    debug_assert!(remainder.is_empty());
+    Ok(chunks
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
+        .collect())
+}
+
+fn f16_values_from_le_bytes(
+    key: &str,
+    shape: &[usize],
+    raw: &[u8],
+) -> Result<Vec<f32>, VaeDecoderError> {
+    check_byte_len(key, shape, raw.len(), 2)?;
+    let (chunks, remainder) = raw.as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    Ok(chunks
+        .iter()
+        .map(|bytes| f16::from_bits(u16::from_le_bytes(*bytes)).to_f32())
+        .collect())
+}
+
+fn bf16_values_from_le_bytes(
+    key: &str,
+    shape: &[usize],
+    raw: &[u8],
+) -> Result<Vec<f32>, VaeDecoderError> {
+    check_byte_len(key, shape, raw.len(), 2)?;
+    let (chunks, remainder) = raw.as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    Ok(chunks
+        .iter()
+        .map(|bytes| half::bf16::from_bits(u16::from_le_bytes(*bytes)).to_f32())
+        .collect())
+}
+
 /// Load a raw f32 1-D tensor from a safetensors view, returning the shape too.
 ///
 /// Supports `bf16`, `f16`, and `f32` dtypes.
@@ -37,34 +112,18 @@ pub fn load_raw_f32<B: Backend>(
     let raw = view.data();
     let dtype = view.dtype();
     let shape: Vec<usize> = view.shape().to_vec();
-    let n: usize = shape.iter().product();
+    let n = checked_element_count(key, &shape)?;
 
     let data_f32: Vec<f32> = match dtype {
-        safetensors::Dtype::F32 => bytemuck::cast_slice(raw).to_vec(),
-        safetensors::Dtype::BF16 => {
-            let u16s: &[u16] = bytemuck::cast_slice(raw);
-            u16s.iter()
-                .map(|&b| half::bf16::from_bits(b).to_f32())
-                .collect()
-        }
-        safetensors::Dtype::F16 => {
-            let u16s: &[u16] = bytemuck::cast_slice(raw);
-            u16s.iter().map(|&b| f16::from_bits(b).to_f32()).collect()
-        }
+        safetensors::Dtype::F32 => f32_values_from_le_bytes(key, &shape, raw)?,
+        safetensors::Dtype::BF16 => bf16_values_from_le_bytes(key, &shape, raw)?,
+        safetensors::Dtype::F16 => f16_values_from_le_bytes(key, &shape, raw)?,
         other => {
             return Err(VaeDecoderError::InvalidArgument {
                 detail: format!("unsupported dtype {other:?} for key {key}"),
             });
         }
     };
-
-    if data_f32.len() != n {
-        return Err(VaeDecoderError::ShapeMismatch {
-            key: key.to_owned(),
-            expected: vec![n],
-            actual: vec![data_f32.len()],
-        });
-    }
 
     let tensor = Tensor::<B, 1>::from_data(TensorData::new(data_f32, vec![n]), device);
     Ok((tensor, shape))
@@ -113,9 +172,7 @@ pub fn load_2d_raw<B: Backend>(
             actual: vec![shape.len()],
         });
     }
-    let d0 = i32::try_from(shape[0]).unwrap_or(i32::MAX);
-    let d1 = i32::try_from(shape[1]).unwrap_or(i32::MAX);
-    Ok(flat.reshape([d0, d1]))
+    Ok(flat.reshape([shape[0], shape[1]]))
 }
 
 /// Load a 2-D linear weight from `PyTorch`'s `[out, in]` layout, transposing to
@@ -146,4 +203,38 @@ pub fn read_config<S: std::hash::BuildHasher>(
         || Ok(serde_json::Value::Object(serde_json::Map::new())),
         |s| serde_json::from_str(s).map_err(VaeDecoderError::Json),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f32_decode_accepts_unaligned_bytes() {
+        let mut bytes = vec![0_u8];
+        bytes.extend_from_slice(&1.25_f32.to_le_bytes());
+        bytes.extend_from_slice(&(-2.5_f32).to_le_bytes());
+
+        let values = f32_values_from_le_bytes("w", &[2], &bytes[1..]).unwrap();
+
+        assert_eq!(values, vec![1.25_f32, -2.5_f32]);
+    }
+
+    #[test]
+    fn f16_decode_accepts_unaligned_bytes() {
+        let mut bytes = vec![0_u8];
+        bytes.extend_from_slice(&f16::from_f32(1.5).to_le_bytes());
+        bytes.extend_from_slice(&f16::from_f32(-0.25).to_le_bytes());
+
+        let values = f16_values_from_le_bytes("w", &[2], &bytes[1..]).unwrap();
+
+        assert_eq!(values, vec![1.5_f32, -0.25_f32]);
+    }
+
+    #[test]
+    fn byte_length_mismatch_errors_instead_of_panicking() {
+        let err = f32_values_from_le_bytes("w", &[2], &[0_u8; 7]).unwrap_err();
+
+        assert!(matches!(err, VaeDecoderError::InvalidArgument { .. }));
+    }
 }

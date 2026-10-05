@@ -18,7 +18,6 @@ thiserror.workspace = true
 safetensors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-bytemuck.workspace = true
 half.workspace = true
 ltx-shape = { path = "../ltx-shape" }
 
