@@ -1,11 +1,11 @@
 //! Smoothstep crossfade blending across temporal chunk seams.
 //!
-//! Each seam has `overlap` frames where consecutive chunks contribute. The
-//! weight for the incoming chunk at offset `i` within the overlap is
-//! `smoothstep(i / overlap)` and for the outgoing chunk it is
-//! `1 − smoothstep(i / overlap)`.  By construction these sum to 1 at every
-//! frame.  Because the stride ≥ overlap constraint is enforced by [`plan`],
-//! no frame belongs to more than two chunks, so the weights tile perfectly.
+//! Each seam has `real_overlap` frames where consecutive chunks contribute.
+//! The weight for the incoming chunk at offset `i` within that overlap is
+//! `smoothstep(i / real_overlap)` and for the outgoing chunk it is
+//! `1 − smoothstep(i / real_overlap)`. The first overlap frame is entirely the
+//! outgoing chunk; the incoming weight approaches, but does not reach, 1 inside
+//! the overlap.
 //!
 //! ## Fixed-seed note
 //! The random seed used to generate each chunk's latent noise is the caller's
@@ -13,11 +13,10 @@
 //! f32 values; it does not touch any random state.
 //!
 //! ## Streaming, bounded memory
-//! The [`Blender`] buffers exactly `overlap × frame_size` f32 values: the
-//! tail of the previous chunk that will be crossfaded with the start of the
-//! next chunk. Frames that no future chunk can modify are moved to an internal
-//! ready queue and emitted via [`Blender::drain`]. After the last chunk is
-//! pushed, call [`Blender::flush`] to emit the tail.
+//! The [`Blender`] buffers one current chunk plus the retained tail from the
+//! previous chunk. Frames that no future chunk can modify are moved to an
+//! internal ready queue and emitted via [`Blender::drain`]. After the last chunk
+//! is pushed and finished, call [`Blender::flush`] to emit any retained tail.
 //!
 //! [`plan`]: crate::plan::plan
 
@@ -42,9 +41,8 @@ pub fn smoothstep(t: f64) -> f64 {
 /// Returns `smoothstep(offset / overlap_len)` in `[0.0, 1.0]` (f32).
 /// The outgoing-chunk weight is `1.0 − crossfade_weight(offset, overlap_len)`.
 ///
-/// # Panics (never)
-/// `overlap_len` is taken as `u32`; the function returns 1.0 when called with
-/// `offset ≥ overlap_len` (clamped by smoothstep).
+/// Note: `overlap_len` is taken as `u32`; the function returns 1.0 when
+/// called with `offset ≥ overlap_len` (clamped by smoothstep).
 #[must_use]
 #[expect(
     clippy::as_conversions,
@@ -68,20 +66,20 @@ pub fn crossfade_weight(offset: u32, overlap_len: u32) -> f32 {
 /// chunk, drain emitted frames with [`drain`][`Blender::drain`], and call
 /// [`flush`][`Blender::flush`] after the last chunk to release the tail.
 ///
-/// Memory: `overlap × frame_pixels × channel_count` f32 values.
+/// Retained memory: one current chunk plus at most one retained tail.
 pub struct Blender {
     chunk_len: u32,
-    overlap: u32,
-    /// `stride` = `chunk_len` − `overlap`.
-    stride: u32,
     /// Number of f32 values per frame.
     frame_size: usize,
     /// Tail frames from the previous chunk waiting to be crossfaded.
-    /// `pending[i * frame_size .. (i+1) * frame_size]` is pending frame i.
     pending: Vec<f32>,
+    /// Number of valid frames in `pending`.
+    pending_valid: u32,
+    /// Frames collected for the current chunk.
+    current: Vec<f32>,
     /// Frames ready to emit, in global order.
     ready: VecDeque<Vec<f32>>,
-    /// How many frames have been pushed to the current chunk (resets each chunk).
+    /// How many frames have been pushed to the current chunk.
     chunk_cursor: u32,
     /// True until the first chunk is complete.
     is_first_chunk: bool,
@@ -125,17 +123,17 @@ impl Blender {
             .checked_mul(channel_count)
             .ok_or(ChunkError::Overflow)?;
 
-        let pending_len = usize::try_from(overlap)
-            .map_err(|_| ChunkError::Overflow)?
+        let chunk_frames = usize::try_from(chunk_len).map_err(|_| ChunkError::Overflow)?;
+        let chunk_values = chunk_frames
             .checked_mul(frame_size)
             .ok_or(ChunkError::Overflow)?;
 
         Ok(Self {
             chunk_len,
-            overlap,
-            stride,
             frame_size,
-            pending: vec![0.0_f32; pending_len],
+            pending: Vec::new(),
+            pending_valid: 0,
+            current: Vec::with_capacity(chunk_values),
             ready: VecDeque::new(),
             chunk_cursor: 0,
             is_first_chunk: true,
@@ -162,49 +160,62 @@ impl Blender {
             });
         }
         if self.chunk_cursor >= self.chunk_len {
-            return Err(ChunkError::FrameOutOfOrder {
-                idx: self.chunk_cursor,
-                expected: 0,
-            });
+            return Err(ChunkError::ChunkAlreadyFull(self.chunk_cursor));
         }
 
-        let i = self.chunk_cursor;
-
-        if self.is_first_chunk {
-            // First chunk has no previous pending.
-            if i < self.stride {
-                // Unique zone: emit directly.
-                self.ready.push_back(pixels.to_vec());
-            } else {
-                // Tail zone: store for the next chunk.
-                let pending_i = i.saturating_sub(self.stride);
-                self.write_pending(pending_i, pixels)?;
-            }
-        } else if i < self.overlap {
-            // Blend zone: crossfade pending with this frame.
-            let w_new = crossfade_weight(i, self.overlap);
-            let blended = self.blend_with_pending(i, pixels, w_new)?;
-            self.ready.push_back(blended);
-        } else if i < self.stride {
-            // Middle zone: emit directly.
-            self.ready.push_back(pixels.to_vec());
-        } else {
-            // Tail zone: store for the next chunk.
-            let pending_i = i.saturating_sub(self.stride);
-            self.write_pending(pending_i, pixels)?;
-        }
-
+        self.current.extend_from_slice(pixels);
         self.chunk_cursor = self.chunk_cursor.saturating_add(1);
         Ok(())
     }
 
     /// Signals that the current chunk is complete.
     ///
-    /// Resets the frame counter and clears the first-chunk flag. Call this
-    /// after pushing all `chunk_len` frames for each chunk.
-    pub const fn finish_chunk(&mut self) {
+    /// `expected_len` is the number of frames the chunk was expected to supply
+    /// (`Chunk::len()` from the temporal plan). `next_overlap` is the overlap
+    /// between this chunk and the next chunk, or 0 for the final chunk.
+    ///
+    /// # Errors
+    /// Returns [`ChunkError`] if the pushed frame count is wrong, if
+    /// `next_overlap` exceeds `expected_len`, or if the previous and next
+    /// overlap regions would intersect inside this chunk.
+    pub fn finish_chunk(&mut self, expected_len: u32, next_overlap: u32) -> Result<(), ChunkError> {
+        if self.chunk_cursor != expected_len {
+            return Err(ChunkError::ChunkFrameCount {
+                got: self.chunk_cursor,
+                expected: expected_len,
+            });
+        }
+        if next_overlap > expected_len {
+            return Err(ChunkError::RetainedOverlapTooLarge {
+                overlap: next_overlap,
+                frames: expected_len,
+            });
+        }
+
+        let emit_until = expected_len.saturating_sub(next_overlap);
+        if !self.is_first_chunk && self.pending_valid > emit_until {
+            return Err(ChunkError::RetainedOverlapTooLarge {
+                overlap: self.pending_valid,
+                frames: emit_until,
+            });
+        }
+
+        for i in 0..expected_len {
+            let frame = self.current_frame(i)?;
+            if !self.is_first_chunk && i < self.pending_valid {
+                let w_new = crossfade_weight(i, self.pending_valid);
+                let blended = self.blend_with_pending(i, frame, w_new)?;
+                self.ready.push_back(blended);
+            } else if i < emit_until {
+                self.ready.push_back(frame.to_vec());
+            }
+        }
+
+        self.retain_tail(expected_len, next_overlap)?;
+        self.current.clear();
         self.chunk_cursor = 0;
         self.is_first_chunk = false;
+        Ok(())
     }
 
     /// Returns an iterator over frames that are ready to emit, draining them
@@ -215,19 +226,18 @@ impl Blender {
         self.ready.drain(..)
     }
 
-    /// Emits the tail frames buffered from the last chunk, then drains them.
+    /// Emits retained tail frames from the last chunk, then clears them.
     ///
     /// Call this once after pushing and finishing the final chunk. Subsequent
-    /// calls yield nothing (the buffer is cleared).
+    /// calls yield nothing.
     pub fn flush(&mut self) -> impl Iterator<Item = Vec<f32>> + '_ {
-        let overlap_usize = usize::try_from(self.overlap).unwrap_or(0);
-        for i in 0..overlap_usize {
-            let offset = i.saturating_mul(self.frame_size);
-            let end = offset.saturating_add(self.frame_size);
-            if let Some(slice) = self.pending.get(offset..end) {
+        for i in 0..self.pending_valid {
+            if let Ok(slice) = self.pending_slice(i) {
                 self.ready.push_back(slice.to_vec());
             }
         }
+        self.pending.clear();
+        self.pending_valid = 0;
         self.ready.drain(..)
     }
 
@@ -240,15 +250,34 @@ impl Blender {
         self.pending.get(offset..end).ok_or(ChunkError::Overflow)
     }
 
-    fn write_pending(&mut self, pending_i: u32, pixels: &[f32]) -> Result<(), ChunkError> {
-        let i = usize::try_from(pending_i).map_err(|_| ChunkError::Overflow)?;
-        let offset = i.saturating_mul(self.frame_size);
-        let end = offset.saturating_add(self.frame_size);
-        let slot = self
-            .pending
-            .get_mut(offset..end)
+    fn current_frame(&self, frame_i: u32) -> Result<&[f32], ChunkError> {
+        let i = usize::try_from(frame_i).map_err(|_| ChunkError::Overflow)?;
+        let offset = i.checked_mul(self.frame_size).ok_or(ChunkError::Overflow)?;
+        let end = offset
+            .checked_add(self.frame_size)
             .ok_or(ChunkError::Overflow)?;
-        slot.copy_from_slice(pixels);
+        self.current.get(offset..end).ok_or(ChunkError::Overflow)
+    }
+
+    fn retain_tail(&mut self, frames: u32, retain: u32) -> Result<(), ChunkError> {
+        if retain == 0 {
+            self.pending.clear();
+            self.pending_valid = 0;
+            return Ok(());
+        }
+        let start_frame = frames.saturating_sub(retain);
+        let start = usize::try_from(start_frame)
+            .map_err(|_| ChunkError::Overflow)?
+            .checked_mul(self.frame_size)
+            .ok_or(ChunkError::Overflow)?;
+        let end = usize::try_from(frames)
+            .map_err(|_| ChunkError::Overflow)?
+            .checked_mul(self.frame_size)
+            .ok_or(ChunkError::Overflow)?;
+        let tail = self.current.get(start..end).ok_or(ChunkError::Overflow)?;
+        self.pending.clear();
+        self.pending.extend_from_slice(tail);
+        self.pending_valid = retain;
         Ok(())
     }
 
@@ -279,6 +308,28 @@ mod tests {
 
     fn make_frame(val: f32) -> Vec<f32> {
         vec![val; FSIZE]
+    }
+
+    fn blend_planned_ramp(total: u32, chunk_len: u32, overlap: u32) -> Vec<f32> {
+        let chunks = crate::plan::plan(total, chunk_len, overlap).unwrap();
+        let mut blender = Blender::new(chunk_len, overlap, 1, 1).unwrap();
+        let mut output = Vec::new();
+
+        for (idx, chunk) in chunks.iter().enumerate() {
+            for global_frame in chunk.start..chunk.end {
+                let value = f32::from(u16::try_from(global_frame).unwrap());
+                blender.push_frame(&[value]).unwrap();
+            }
+            let next_overlap = chunks
+                .get(idx.saturating_add(1))
+                .map_or(0, |next| next.real_overlap);
+            blender.finish_chunk(chunk.len(), next_overlap).unwrap();
+            output.extend(blender.drain().filter_map(|frame| frame.first().copied()));
+        }
+
+        output.extend(blender.flush().filter_map(|frame| frame.first().copied()));
+        assert_eq!(blender.flush().count(), 0);
+        output
     }
 
     // ── smoothstep & crossfade_weight ──────────────────────────────────────
@@ -337,7 +388,7 @@ mod tests {
         for _ in 0..chunk_len {
             blender.push_frame(&make_frame(1.0)).unwrap();
         }
-        blender.finish_chunk();
+        blender.finish_chunk(chunk_len, overlap).unwrap();
         for f in blender.drain() {
             output.extend(f);
         }
@@ -346,7 +397,7 @@ mod tests {
         for _ in 0..chunk_len {
             blender.push_frame(&make_frame(1.0)).unwrap();
         }
-        blender.finish_chunk();
+        blender.finish_chunk(chunk_len, 0).unwrap();
         for f in blender.drain() {
             output.extend(f);
         }
@@ -383,7 +434,7 @@ mod tests {
             let v = f32::from(u16::try_from(i).unwrap());
             blender.push_frame(&[v; FSIZE]).unwrap();
         }
-        blender.finish_chunk();
+        blender.finish_chunk(chunk_len, overlap).unwrap();
         for f in blender.drain() {
             output.extend(f);
         }
@@ -393,7 +444,7 @@ mod tests {
             let v = f32::from(u16::try_from(stride.saturating_add(i)).unwrap());
             blender.push_frame(&[v; FSIZE]).unwrap();
         }
-        blender.finish_chunk();
+        blender.finish_chunk(chunk_len, 0).unwrap();
         for f in blender.drain() {
             output.extend(f);
         }
@@ -431,7 +482,7 @@ mod tests {
         for _ in 0..chunk_len {
             blender.push_frame(&[-1.0_f32]).unwrap();
         }
-        blender.finish_chunk();
+        blender.finish_chunk(chunk_len, overlap).unwrap();
         for f in blender.drain() {
             if let Some(&v) = f.first() {
                 output.push(v);
@@ -441,7 +492,7 @@ mod tests {
         for _ in 0..chunk_len {
             blender.push_frame(&[1.0_f32]).unwrap();
         }
-        blender.finish_chunk();
+        blender.finish_chunk(chunk_len, 0).unwrap();
         for f in blender.drain() {
             if let Some(&v) = f.first() {
                 output.push(v);
@@ -491,7 +542,7 @@ mod tests {
         for _ in 0..chunk_len {
             blender.push_frame(&make_frame(7.0)).unwrap();
         }
-        blender.finish_chunk();
+        blender.finish_chunk(chunk_len, 0).unwrap();
         let n_drain = blender.drain().count();
         let n_flush = blender.flush().count();
         let total_frames = n_drain.saturating_add(n_flush);
@@ -508,12 +559,50 @@ mod tests {
     }
 
     #[test]
-    fn memory_is_bounded_by_overlap() {
-        // Blender with overlap=8 and large chunk should buffer at most 8 frames.
+    fn planned_ramp_handles_anchored_totals() {
+        for total in [5_u32, 18, 28, 40] {
+            let output = blend_planned_ramp(total, 17, 8);
+            assert_eq!(output.len(), usize::try_from(total).unwrap());
+            for (idx, got) in output.iter().enumerate() {
+                let expected = f32::from(u16::try_from(idx).unwrap());
+                assert!(
+                    (*got - expected).abs() < 1e-4_f32,
+                    "total {total} frame {idx}: expected {expected}, got {got}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finish_chunk_rejects_short_chunk() {
+        let mut blender = Blender::new(17, 8, 1, 1).unwrap();
+        blender.push_frame(&[1.0_f32]).unwrap();
+        assert_eq!(
+            blender.finish_chunk(17, 0),
+            Err(ChunkError::ChunkFrameCount {
+                got: 1,
+                expected: 17,
+            })
+        );
+    }
+
+    #[test]
+    fn flush_without_pending_is_empty_and_idempotent() {
+        let mut blender = Blender::new(17, 8, 1, 1).unwrap();
+        assert_eq!(blender.flush().count(), 0);
+        assert_eq!(blender.flush().count(), 0);
+    }
+
+    #[test]
+    fn memory_is_bounded_by_retained_overlap() {
         let overlap: u32 = 8;
         let chunk_len: u32 = 33;
-        let b = Blender::new(chunk_len, overlap, 1, 1).unwrap();
-        // pending vec length == overlap * frame_size
+        let mut b = Blender::new(chunk_len, overlap, 1, 1).unwrap();
+        for _ in 0..chunk_len {
+            b.push_frame(&[1.0_f32]).unwrap();
+        }
+        b.finish_chunk(chunk_len, overlap).unwrap();
         assert_eq!(b.pending.len(), usize::try_from(overlap).unwrap());
+        assert_eq!(b.pending_valid, overlap);
     }
 }

@@ -76,6 +76,18 @@ pub enum ChunkError {
     #[error("frame at chunk-local index {idx} out of order; expected {expected}")]
     FrameOutOfOrder { idx: u32, expected: u32 },
 
+    /// A chunk was finished with the wrong number of frames.
+    #[error("chunk has {got} frames, expected {expected}")]
+    ChunkFrameCount { got: u32, expected: u32 },
+
+    /// The requested retained overlap exceeds the current chunk length.
+    #[error("retained overlap {overlap} exceeds chunk frame count {frames}")]
+    RetainedOverlapTooLarge { overlap: u32, frames: u32 },
+
+    /// A frame was pushed after the current chunk was already full.
+    #[error("current chunk already has {0} frames")]
+    ChunkAlreadyFull(u32),
+
     /// `overlap` must be non-zero when requesting a seam conditioning plan.
     #[error("overlap must be non-zero for a seam conditioning plan")]
     ZeroOverlapForSeam,
