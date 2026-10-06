@@ -14,3 +14,4 @@ python -W ignore tools/parity/ltx-dit.py
 | `ltx-weights.py` | `ltx-weights` | BF16 base + LoRA, FP8+scale, transformer KeyMap, IC-LoRA layout |
 | `ltx-dit.py` | `ltx-dit` | 2-block tiny video `DiT` (random init, seed 42): weights + inputs + reference output; `atol=1e-4` `rtol=1e-3` |
 | `ltx-vae-decoder.py` | `ltx-vae-decoder` | Full decode forward pass: weights + latent + noise + pixels |
+| `ltx-vae-decoder-scale.py` | `ltx-vae-decoder` | Scale fixtures: (1) edge+interior NA windows; (2) 2×2 spatial tiled decode |
