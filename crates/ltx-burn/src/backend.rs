@@ -138,23 +138,7 @@ impl<B: Backend> BurnBackend<B> {
         let positive_context: Tensor<B, 3> = ctx_scope.tensor("positive.video_encoding", device)?;
         let negative_context: Option<Tensor<B, 3>> =
             ctx_scope.optional("negative.video_encoding", device)?;
-        // Validate cfg_scale is finite; NaN would silently pass needs_uncond()
-        // (which checks abs distance, returning false for NaN) and propagate
-        // into the guider as NaN arithmetic.
-        if !settings.cfg_scale.is_finite() {
-            return Err(BurnError::InvalidInput(format!(
-                "cfg_scale {} must be finite",
-                settings.cfg_scale
-            )));
-        }
-        // Fail early when cfg_scale != 1 but no negative context was provided.
-        if ltx_sampler::GuiderParams::alpha_gen(settings.cfg_scale).needs_uncond()
-            && negative_context.is_none()
-        {
-            return Err(BurnError::MissingNegativeContext {
-                cfg_scale: settings.cfg_scale,
-            });
-        }
+        validate_settings(&settings, negative_context.is_some())?;
 
         Ok(Self {
             transformer,
@@ -661,6 +645,12 @@ fn interleaved_to_channels_first<B: Backend>(
 /// `resize_and_center_crop` in `ltx_pipelines.utils.media_io.resize`.
 ///
 /// All computation is done in `f64` host-side to match PyTorch's internal precision.
+/// The `ceil` step uses exact integer `div_ceil` to avoid floating-point off-by-one
+/// errors that occur when `src * scale` is within machine epsilon of an integer.
+///
+/// # Panics / Errors
+/// Returns `Err` when `batch != 1`, when tensor data cannot be read, or when the
+/// internal geometry is inconsistent (should not happen given the validation above).
 #[expect(
     clippy::doc_markdown,
     reason = "PyTorch is a proper noun; False is Python bool literal, not a Rust item"
@@ -671,13 +661,13 @@ fn interleaved_to_channels_first<B: Backend>(
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    reason = "bilinear coord math uses f64 for PyTorch parity; casts are range-checked"
+    reason = "bilinear coordinate math uses f64 for PyTorch parity; casts are range-checked by floor+clamp"
 )]
 #[expect(
     clippy::arithmetic_side_effects,
     clippy::indexing_slicing,
     clippy::suboptimal_flops,
-    reason = "index arithmetic and interpolation formula are verified by dimension checks and parity tests"
+    reason = "index arithmetic is bounded by validated dimensions; mul_add formula matches the reference exactly"
 )]
 fn resize_and_center_crop_5d<B: Backend>(
     tensor: Tensor<B, 5>,
@@ -692,20 +682,38 @@ fn resize_and_center_crop_5d<B: Backend>(
             "batch must be 1, got {nb}"
         )));
     }
-    // PyTorch scale: max(dst_h/src_h, dst_w/src_w)
-    let scale_h = dst_h as f64 / src_h as f64;
-    let scale_w = dst_w as f64 / src_w as f64;
-    let scale = scale_h.max(scale_w);
-    let new_h = (src_h as f64 * scale).ceil() as usize;
-    let new_w = (src_w as f64 * scale).ceil() as usize;
-    let crop_top = (new_h - dst_h) / 2;
-    let crop_left = (new_w - dst_w) / 2;
 
+    // Exact-integer ceiling avoids FP off-by-one when src*scale is within
+    // machine epsilon of an integer (matches Python math.ceil behaviour).
+    // scale = max(dst_h/src_h, dst_w/src_w); represented as cross-multiplied comparison.
+    let (new_h, new_w) = if dst_h * src_w >= dst_w * src_h {
+        // h-dominant: scale = dst_h/src_h; new_h = dst_h exactly.
+        let new_w = (src_w * dst_h).div_ceil(src_h);
+        (dst_h, new_w)
+    } else {
+        // w-dominant: scale = dst_w/src_w; new_w = dst_w exactly.
+        let new_h = (src_h * dst_w).div_ceil(src_w);
+        (new_h, dst_w)
+    };
+    // Safety: new_h >= dst_h and new_w >= dst_w by construction above.
+    let crop_top = new_h.checked_sub(dst_h).ok_or_else(|| {
+        BurnError::InvalidInput(format!(
+            "resize geometry error: new_h={new_h} < dst_h={dst_h}"
+        ))
+    })? / 2;
+    let crop_left = new_w.checked_sub(dst_w).ok_or_else(|| {
+        BurnError::InvalidInput(format!(
+            "resize geometry error: new_w={new_w} < dst_w={dst_w}"
+        ))
+    })? / 2;
+
+    // Pull to host. This forces a device sync on Metal/CUDA; acceptable here
+    // because `build_reference_latent` is called once per chunk, not per token.
     let src_data: Vec<f32> = tensor
         .into_data()
         .convert::<f32>()
         .to_vec::<f32>()
-        .map_err(|_| BurnError::Overflow)?;
+        .map_err(|e| BurnError::InvalidInput(format!("tensor data read failed: {e}")))?;
 
     // src layout: [nb=1, nc, nf, src_h, src_w]
     let src_frame_stride = nc * src_h * src_w;
@@ -798,6 +806,26 @@ fn pixels_to_alpha<B: Backend>(
         .to_vec::<f32>()
         .map_err(|_| BurnError::Overflow)
 }
+/// Validate `GenerationSettings` against the available context.
+///
+/// Factored out of [`BurnBackend::load`] so it can be unit-tested without
+/// requiring real safetensors files.
+fn validate_settings(settings: &GenerationSettings, has_negative: bool) -> Result<(), BurnError> {
+    // NaN would silently bypass needs_uncond() (which checks abs distance,
+    // returning false for NaN) and cause silent NaN propagation in the guider.
+    if !settings.cfg_scale.is_finite() {
+        return Err(BurnError::InvalidInput(format!(
+            "cfg_scale {} must be finite",
+            settings.cfg_scale
+        )));
+    }
+    if ltx_sampler::GuiderParams::alpha_gen(settings.cfg_scale).needs_uncond() && !has_negative {
+        return Err(BurnError::MissingNegativeContext {
+            cfg_scale: settings.cfg_scale,
+        });
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 #[allow(
@@ -812,7 +840,8 @@ mod tests {
     use burn::backend::{NdArray, ndarray::NdArrayDevice};
     use burn::tensor::{Tensor, TensorData};
 
-    use super::{latent_frames, resize_and_center_crop_5d, temporal_subsample};
+    use super::{latent_frames, resize_and_center_crop_5d, temporal_subsample, validate_settings};
+    use crate::{BurnError, GenerationSettings};
 
     type B = NdArray;
 
@@ -878,29 +907,76 @@ mod tests {
         assert_eq!(kept, vec![0.0, 1.0, 3.0]);
     }
     #[test]
-    fn latent_frames_rejects_non_multiple() {
-        // temporal_factor=8, pixel_f=4 → (4-1)/8=0 remainder 3 ≠ 0,
-        // but the encoder will crop; latent_frames gives (4-1)//8 + 1 = 1 not error.
-        // We test that zero temporal_factor is the only hard error.
+    fn latent_frames_floors_and_rejects_zero_factor() {
+        // Zero temporal_factor is the only hard error.
         assert!(latent_frames(1, 0).is_err());
         // Non-multiples silently floor (matches encoder behaviour).
         assert_eq!(latent_frames(4, 8).unwrap(), 1);
     }
 
     #[test]
-    fn cfg_scale_nan_is_rejected_as_non_finite() {
-        // load() rejects non-finite cfg_scale; verify the predicate is correct.
-        let nan_scale = f32::NAN;
-        assert!(!nan_scale.is_finite(), "NaN must be non-finite");
-        let inf_scale = f32::INFINITY;
-        assert!(!inf_scale.is_finite(), "Inf must be non-finite");
+    fn validate_settings_rejects_nan_cfg_scale() {
+        let s = GenerationSettings {
+            cfg_scale: f32::NAN,
+            ..GenerationSettings::default()
+        };
+        assert!(validate_settings(&s, true).is_err());
     }
 
     #[test]
-    fn needs_uncond_is_true_for_cfg_ne_1() {
-        // GuiderParams::alpha_gen(2.0).needs_uncond() must be true;
-        // load() uses this to validate that negative_context exists.
-        assert!(ltx_sampler::GuiderParams::alpha_gen(2.0_f32).needs_uncond());
-        assert!(!ltx_sampler::GuiderParams::alpha_gen(1.0_f32).needs_uncond());
+    fn validate_settings_rejects_inf_cfg_scale() {
+        let s = GenerationSettings {
+            cfg_scale: f32::INFINITY,
+            ..GenerationSettings::default()
+        };
+        assert!(validate_settings(&s, true).is_err());
+    }
+
+    #[test]
+    fn validate_settings_rejects_missing_negative_for_cfg_ne_1() {
+        let s = GenerationSettings {
+            cfg_scale: 2.0,
+            ..GenerationSettings::default()
+        };
+        assert!(matches!(
+            validate_settings(&s, false),
+            Err(BurnError::MissingNegativeContext { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_settings_accepts_cfg_1_without_negative() {
+        let s = GenerationSettings {
+            cfg_scale: 1.0,
+            ..GenerationSettings::default()
+        };
+        assert!(validate_settings(&s, false).is_ok());
+    }
+
+    #[test]
+    fn validate_settings_accepts_cfg_ne_1_with_negative() {
+        let s = GenerationSettings {
+            cfg_scale: 2.0,
+            ..GenerationSettings::default()
+        };
+        assert!(validate_settings(&s, true).is_ok());
+    }
+
+    #[test]
+    fn bilinear_resize_non_square_with_crop() {
+        let device = NdArrayDevice::default();
+        // Source 1×8 (h=1, w=8), target 1×4: scale = max(1/1, 4/8) = 1.0 (h-dominant).
+        // new_h = 1, new_w = 8; crop_left = (8-4)/2 = 2.
+        // Output is the center 4 columns of the source.
+        let data: Vec<f32> = (0..8_u32).map(|i| i as f32).collect(); // [0,1,2,3,4,5,6,7]
+        let x: Tensor<B, 5> = Tensor::from_data(TensorData::new(data, [1, 1, 1, 1, 8]), &device);
+        let out = resize_and_center_crop_5d::<B>(x, 1, 4, &device).unwrap();
+        let got: Vec<f32> = out.into_data().convert::<f32>().to_vec().unwrap();
+        // crop_left=2 → columns 2,3,4,5
+        assert_eq!(
+            got,
+            vec![2.0, 3.0, 4.0, 5.0],
+            "non-square crop failed: {got:?}"
+        );
     }
 }

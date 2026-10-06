@@ -343,20 +343,20 @@ def run_pipeline(enc, dec, transformer):
 
     with torch.no_grad():
         # ── step 1: reference VAE encode ─────────────────────────────────────
-        import torch.nn.functional as F  # noqa: PLC0415
+        # Use the actual reference function (resize_and_center_crop) rather than
+        # a direct F.interpolate call, so any aspect-ratio / crop discrepancy
+        # between Python and Rust would show up as a parity failure.
+        from ltx_pipelines.utils.media_io.resize import resize_and_center_crop  # noqa: PLC0415
         ref_indices = [0] + list(range(1, PIXEL_F, REF_TS))  # [0, 1]
         ref_rgb = rgb[:, :, ref_indices]      # [1, 3, 2, H, W]
         if REF_DS > 1:
-            # Bilinear resize from (PIXEL_H, PIXEL_W) → (PIXEL_H//REF_DS, PIXEL_W//REF_DS)
-            # matching Rust resize_and_center_crop_5d (align_corners=False).
             ref_h_pix = PIXEL_H // REF_DS
             ref_w_pix = PIXEL_W // REF_DS
-            ref_rgb_4d = ref_rgb.squeeze(0).permute(1, 0, 2, 3)  # [F, 3, H, W]
-            ref_rgb_small = F.interpolate(
-                ref_rgb_4d.float(), size=(ref_h_pix, ref_w_pix),
-                mode='bilinear', align_corners=False
-            )
-            ref_rgb = ref_rgb_small.permute(1, 0, 2, 3).unsqueeze(0)  # [1, 3, F, h, w]
+            # resize_and_center_crop expects [F, H, W, C] input.
+            ref_rgb_fhwc = ref_rgb.squeeze(0).permute(1, 2, 3, 0)  # [F, H, W, 3]
+            ref_rgb = resize_and_center_crop(
+                ref_rgb_fhwc.float(), ref_h_pix, ref_w_pix
+            )  # returns [1, 3, F, h, w]
         ref_latent = enc(ref_rgb)              # [1, 4, 1, 2, 2]
         assert ref_latent.shape == (1, LAT_C, REF_LAT_F, LAT_H // REF_DS, LAT_W // REF_DS), (
             f"unexpected ref_latent shape {ref_latent.shape}"
