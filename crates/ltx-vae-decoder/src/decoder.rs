@@ -441,10 +441,9 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
         // ── conv_in ───────────────────────────────────────────────────────
         let conv_in = scope_linear(&scope.scope("conv_in"), device)?;
 
-        // ── type_emb (Bug 3 fix: shape = in_channels, not stage_channels[0]) ──
-        let type_emb_val = scope
-            .optional::<B, 1>("type_emb", device)?
-            .unwrap_or_else(|| Tensor::zeros([config.in_channels], device));
+        // ── type_emb: required (KeyMap::video_decoder synthesises zeros for
+        //   pre-keyframe checkpoints; mis-keyed stores must not silently decode) ──
+        let type_emb_val: Tensor<B, 1> = scope.tensor("type_emb", device)?;
         let type_emb = Param::from_tensor(type_emb_val);
 
         // ── deterministic stages ──────────────────────────────────────────
@@ -468,6 +467,7 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
                 linear_1: l1,
                 linear_2: l2,
             },
+            // 256 is the fixed sinusoidal projection width in PixArtAlpha (not config-driven).
             num_channels: 256,
         };
 
@@ -480,10 +480,22 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
         let conv_in_x_t = scope_linear(&scope.scope("conv_in_x_t"), device)?;
 
         // ── diff_blocks ───────────────────────────────────────────────────
-        let d5 = config.stage_depths.last().copied().unwrap_or(8);
+        // validate() guarantees stage_depths and stage_channels are non-empty.
+        let d5 =
+            config
+                .stage_depths
+                .last()
+                .copied()
+                .ok_or_else(|| VaeDecoderError::InvalidConfig {
+                    detail: "stage_depths is empty after validate".to_owned(),
+                })?;
         let stage5_kernel = config.stage5_kernel;
-        // Bug 2 fix: context_channels = stage_channels.last() not stage_channels[len-2]
-        let c_ctx = config.stage_channels.last().copied().unwrap_or(128);
+        // context_channels = stage_channels.last() (Python: stage_channels[-1])
+        let c_ctx = config.stage_channels.last().copied().ok_or_else(|| {
+            VaeDecoderError::InvalidConfig {
+                detail: "stage_channels is empty after validate".to_owned(),
+            }
+        })?;
         let mut diff_blocks = Vec::with_capacity(d5);
         for bi in 0..d5 {
             diff_blocks.push(scope_diff_block(

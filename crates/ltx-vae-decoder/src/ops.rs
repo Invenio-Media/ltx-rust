@@ -28,7 +28,7 @@ use crate::error::VaeDecoderError;
 #[expect(clippy::many_single_char_names, reason = "tensor dim variables")]
 #[expect(
     clippy::arithmetic_side_effects,
-    reason = "Burn tensor ops run on device; Rust host integer overflow is not possible"
+    reason = "host usize arithmetic on tensor dims; dims are bounded by available memory so overflow is unreachable"
 )]
 pub fn patchify<B: Backend>(
     x: Tensor<B, 5>,
@@ -85,7 +85,7 @@ pub fn patchify<B: Backend>(
 /// Returns [`VaeDecoderError::InvalidArgument`] when C is not divisible by `p²`.
 #[expect(
     clippy::arithmetic_side_effects,
-    reason = "Burn tensor ops run on device; Rust host integer overflow is not possible"
+    reason = "host usize arithmetic on tensor dims; dims are bounded by available memory so overflow is unreachable"
 )]
 pub fn unpatchify<B: Backend>(
     x: Tensor<B, 5>,
@@ -124,4 +124,72 @@ pub fn unpatchify<B: Backend>(
     // Merge w_small and pw → W: [B, C, F, H, W]
     let w_out = w_small * p;
     Ok(x.reshape([b, channels, f, h_out, w_out]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::{NdArray, ndarray::NdArrayDevice};
+    use burn::tensor::{Tensor, TensorData};
+
+    type B = NdArray;
+
+    fn device() -> NdArrayDevice {
+        NdArrayDevice::default()
+    }
+
+    #[test]
+    fn patchify_identity_at_p1() {
+        let d = device();
+        let x: Tensor<B, 5> = Tensor::from_data(
+            TensorData::new(vec![1.0f32, 2.0, 3.0, 4.0], [1, 1, 1, 2, 2]),
+            &d,
+        );
+        let y = patchify(x.clone(), 1).unwrap();
+        let z = unpatchify(y, 1).unwrap();
+        let orig = x.into_data().convert::<f32>();
+        let got = z.into_data().convert::<f32>();
+        assert_eq!(orig, got, "p=1 round-trip must be identity");
+    }
+
+    #[test]
+    fn patchify_roundtrip_p2() {
+        let d = device();
+        // [1, 3, 1, 4, 4] patchify(p=2) → [1, 12, 1, 2, 2] unpatchify → same
+        let vals: Vec<f32> = (0_u8..48).map(f32::from).collect();
+        let x: Tensor<B, 5> = Tensor::from_data(TensorData::new(vals.clone(), [1, 3, 1, 4, 4]), &d);
+        let patched = patchify(x, 2).unwrap();
+        assert_eq!(patched.dims(), [1, 12, 1, 2, 2], "patch shape mismatch");
+        let recovered = unpatchify(patched, 2).unwrap();
+        let got = recovered.into_data().convert::<f32>();
+        assert_eq!(
+            got,
+            TensorData::new(vals, [1, 3, 1, 4, 4]).convert::<f32>(),
+            "p=2 round-trip must be identity"
+        );
+    }
+
+    #[test]
+    fn patchify_channel_ordering_matches_reference() {
+        // Hand-computed: [1, 1, 1, 2, 2] with a=0 (h0w0), b=1 (h0w1), c=2 (h1w0), d=3 (h1w1).
+        // Encoding `(c, pw_sub, ph_sub)` outer=W, inner=H (einops `(c r q)` pattern):
+        //   ch0 = (pw=0, ph=0) → w0,h0 = 0 (a)
+        //   ch1 = (pw=0, ph=1) → w0,h1 = 2 (c)
+        //   ch2 = (pw=1, ph=0) → w1,h0 = 1 (b)
+        //   ch3 = (pw=1, ph=1) → w1,h1 = 3 (d)
+        let d = device();
+        let x: Tensor<B, 5> = Tensor::from_data(
+            TensorData::new(vec![0.0f32, 1.0, 2.0, 3.0], [1, 1, 1, 2, 2]),
+            &d,
+        );
+        let patched = patchify(x, 2).unwrap();
+        assert_eq!(patched.dims(), [1, 4, 1, 1, 1], "output shape mismatch");
+        let data = patched.into_data().convert::<f32>();
+        let expected =
+            TensorData::new(vec![0.0f32, 2.0, 1.0, 3.0], [1, 4, 1, 1, 1]).convert::<f32>();
+        assert_eq!(
+            data, expected,
+            "channel ordering must match Python einops (c r q)"
+        );
+    }
 }

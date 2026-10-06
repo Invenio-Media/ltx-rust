@@ -42,7 +42,7 @@ impl<B: Backend> LinearPixelShuffleUpsample<B> {
     #[expect(clippy::many_single_char_names, reason = "tensor dim variables")]
     #[expect(
         clippy::arithmetic_side_effects,
-        reason = "Burn tensor ops run on device; Rust host integer overflow is not possible"
+        reason = "host usize arithmetic on tensor dims; dims are bounded by available memory so overflow is unreachable"
     )]
     pub fn forward(&self, x: Tensor<B, 5>, drop_leading_frame: bool) -> Tensor<B, 5> {
         let [b, t, h, w, _] = x.dims();
