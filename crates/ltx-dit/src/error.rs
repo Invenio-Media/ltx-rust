@@ -7,11 +7,7 @@ pub enum DitError {
     #[error("config error: {0}")]
     Config(String),
 
-    /// A safetensors I/O error (used by fixture loading in tests).
-    #[error("safetensors: {0}")]
-    Safetensors(#[from] safetensors::SafeTensorError),
-
-    /// A JSON decode error.
+    /// A JSON decode error (from [`DiTConfig::from_json`]).
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 

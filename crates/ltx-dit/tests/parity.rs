@@ -105,3 +105,114 @@ fn parity_video_transformer() {
     let got: Vec<f32> = output.into_data().to_vec().unwrap();
     assert_tensors_close(&got, &expected_host.data, "output");
 }
+// ── Error-path and branch-coverage tests ─────────────────────────────────────
+//
+// These tests use the parity fixture with a modified config to drive error
+// and untested-flag code paths.  The fixture has a 2-block tiny model with
+// apply_gated_attention=false and cross_attention_adaln=false (22B defaults).
+
+/// Helper: load the fixture config.
+fn fixture_config() -> DiTConfig {
+    let path = fixture("dit_parity.safetensors");
+    let store = WeightStore::open(&[&path], &KeyMap::identity()).unwrap();
+    let cfg_json = store.config().unwrap();
+    let cfg_val = cfg_json.get("transformer").unwrap_or(&cfg_json);
+    DiTConfig::from_json(cfg_val).unwrap()
+}
+
+/// Helper: open the fixture store.
+fn fixture_store() -> WeightStore {
+    let path = fixture("dit_parity.safetensors");
+    WeightStore::open(&[&path], &KeyMap::identity()).unwrap()
+}
+
+/// Load with `num_layers=3` but the fixture only has 2 blocks → missing key.
+#[test]
+fn load_missing_block_key_returns_error() {
+    let path = fixture("dit_parity.safetensors");
+    if !path.exists() {
+        return; // skip if fixture absent
+    }
+    let store = fixture_store();
+    let device = NdArrayDevice::default();
+    let mut config = fixture_config();
+    config.num_layers = 3; // block 2 keys are missing in the 2-block fixture
+
+    let scope = store.scope("");
+    let result = VideoTransformer::<B>::load(&scope, &config, &device);
+    assert!(
+        matches!(result, Err(ltx_dit::DitError::Weight(_))),
+        "expected weight error for missing block key, got {result:?}"
+    );
+}
+
+/// Load with wrong `attention_head_dim` → shape mismatch on `to_q.weight`.
+#[test]
+fn load_wrong_shape_returns_error() {
+    let path = fixture("dit_parity.safetensors");
+    if !path.exists() {
+        return;
+    }
+    let store = fixture_store();
+    let device = NdArrayDevice::default();
+    let mut config = fixture_config();
+    // The fixture has attention_head_dim=8; using 16 makes inner_dim=64,
+    // so check_2d on to_q.weight fires (fixture has [32,32] not [64,64]).
+    config.attention_head_dim = 16;
+
+    let scope = store.scope("");
+    let result = VideoTransformer::<B>::load(&scope, &config, &device);
+    assert!(
+        matches!(result, Err(ltx_dit::DitError::Weight(_))),
+        "expected weight error for shape mismatch, got {result:?}"
+    );
+}
+
+/// Load with `apply_gated_attention=true` → `to_gate_logits` keys are absent → error.
+///
+/// This exercises the gated-attention branch of `load_attention`, which is
+/// NOT exercised by the main parity fixture (22B default: `apply_gated_attention=false`).
+#[test]
+fn load_gated_attn_missing_key_returns_error() {
+    let path = fixture("dit_parity.safetensors");
+    if !path.exists() {
+        return;
+    }
+    let store = fixture_store();
+    let device = NdArrayDevice::default();
+    let mut config = fixture_config();
+    config.flags.apply_gated_attention = true; // fixture has no to_gate_logits keys
+
+    let scope = store.scope("");
+    let result = VideoTransformer::<B>::load(&scope, &config, &device);
+    assert!(
+        matches!(result, Err(ltx_dit::DitError::Weight(_))),
+        "expected weight error for missing to_gate_logits, got {result:?}"
+    );
+}
+
+/// Load with `cross_attention_adaln=true` → `prompt_scale_shift_table` absent → error.
+///
+/// This exercises the `cross_attention_adaln` branch of `load_block`, which is
+/// NOT exercised by the main parity fixture (22B default: `cross_attention_adaln=false`).
+/// Note: [`DiTConfig::validate`] rejects `cross_attention_adaln=true` together with
+/// `use_prompt_adaln_single=true` (not wired), so we disable the latter first.
+#[test]
+fn load_cross_attn_adaln_missing_key_returns_error() {
+    let path = fixture("dit_parity.safetensors");
+    if !path.exists() {
+        return;
+    }
+    let store = fixture_store();
+    let device = NdArrayDevice::default();
+    let mut config = fixture_config();
+    config.flags.cross_attention_adaln = true;
+    config.flags.use_prompt_adaln_single = false; // required to pass validate()
+
+    let scope = store.scope("");
+    let result = VideoTransformer::<B>::load(&scope, &config, &device);
+    assert!(
+        matches!(result, Err(ltx_dit::DitError::Weight(_))),
+        "expected weight error for missing prompt_scale_shift_table, got {result:?}"
+    );
+}
