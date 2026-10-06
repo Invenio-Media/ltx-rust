@@ -62,6 +62,13 @@ pub fn rot_abs_axis<B: Backend>(
     let axis_len = all_dims[pos_axis];
     let head_size = all_dims[5];
     let d_half = head_size.checked_div(2).unwrap_or(0);
+    let [d0, d1, d2, d3, d4, _d5] = all_dims;
+    // n = total elements across all non-head dims
+    let n = d0
+        .saturating_mul(d1)
+        .saturating_mul(d2)
+        .saturating_mul(d3)
+        .saturating_mul(d4);
 
     // positions: [axis_len]
     #[expect(
@@ -86,24 +93,28 @@ pub fn rot_abs_axis<B: Backend>(
     let cos_ang = ang.clone().reshape(bcast_shape).cos();
     let sin_ang = ang.reshape(bcast_shape).sin();
 
-    // Split x into even/odd pairs on the last dim.
-    let [d0, d1, d2, d3, d4, _d5] = all_dims;
-    let x_pairs = x.reshape([d0, d1, d2, d3, d4, d_half, 2]);
-    let xe = x_pairs
+    // Extract even/odd pairs via 3-D reshape (avoids NdArray's 6-D limit).
+    // x: [d0,d1,d2,d3,d4,head_size] → flat → [n, d_half, 2] (3-D)
+    let x_pairs: Tensor<B, 3> = x.reshape([n, d_half, 2]);
+    let xe: Tensor<B, 6> = x_pairs
         .clone()
-        .slice([0..d0, 0..d1, 0..d2, 0..d3, 0..d4, 0..d_half, 0..1])
-        .squeeze_dim::<6>(6);
-    let xo = x_pairs
-        .slice([0..d0, 0..d1, 0..d2, 0..d3, 0..d4, 0..d_half, 1..2])
-        .squeeze_dim::<6>(6);
+        .slice([0..n, 0..d_half, 0..1])
+        .reshape([d0, d1, d2, d3, d4, d_half]);
+    let xo: Tensor<B, 6> = x_pairs
+        .slice([0..n, 0..d_half, 1..2])
+        .reshape([d0, d1, d2, d3, d4, d_half]);
 
-    // Apply rotation.
-    let re = xe.clone() * cos_ang.clone() - xo.clone() * sin_ang.clone();
-    let ro = xe * sin_ang + xo * cos_ang;
+    // Apply rotation (6-D broadcast; cos/sin broadcast over spatial dims).
+    let re: Tensor<B, 6> = xe.clone() * cos_ang.clone() - xo.clone() * sin_ang.clone();
+    let ro: Tensor<B, 6> = xe * sin_ang + xo * cos_ang;
 
-    // Interleave: stack → [..., d_half, 2] → [..., head_size]
-    let stacked = Tensor::stack::<7>(vec![re, ro], 6);
-    stacked.reshape([d0, d1, d2, d3, d4, head_size])
+    // Interleave via 3-D cat (avoids Tensor::stack::<7> which exceeds NdArray 6-D limit).
+    // re, ro: [d0,d1,d2,d3,d4,d_half] → cat over a new trailing dim → reshape back.
+    Tensor::cat(
+        vec![re.reshape([n, d_half, 1]), ro.reshape([n, d_half, 1])],
+        2,
+    )
+    .reshape([d0, d1, d2, d3, d4, head_size])
 }
 
 /// Apply full-volume absolute `RoPE` to a `[B, T, H, W, NH, HD]` tensor.

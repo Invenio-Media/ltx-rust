@@ -27,19 +27,15 @@
 //! NATTEN/Triton kernels are required for production; CPU parity tests with
 //! N ≲ 100 are tractable.
 
-use std::path::Path;
-
 use burn::{
     module::{Module, Param},
     nn,
     tensor::{Tensor, backend::Backend},
 };
-use safetensors::SafeTensors;
 
 use crate::{
     config::{DecoderConfig, ModelOutputType, UpsampleSpec},
     error::VaeDecoderError,
-    load::{load_1d, load_2d_raw, load_linear_weight},
     nn::{
         adaln::AdaLnZero,
         attention::NeighborhoodAttention3D,
@@ -278,7 +274,7 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
         t_scalar: f32,
         device: &B::Device,
     ) -> Result<Tensor<B, 5>, VaeDecoderError> {
-        let [b, c_ctx, _ctx_t, _ctx_h, _ctx_w] = context.dims();
+        let [b, _ctx_t, _ctx_h, _ctx_w, c_ctx] = context.dims();
 
         // Patchify and project noised pixels.
         let patched = patchify(x_t, self.patch_size)?;
@@ -412,152 +408,102 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
 // ─── Construction ─────────────────────────────────────────────────────────────
 
 impl<B: Backend> DiffusionVideoDecoder<B> {
-    /// Load weights from a safetensors file.
+    /// Load weights from a [`ltx_weights::Scope`].
     ///
-    /// `key_prefix` is prepended to every state-dict key (`""` for a fixture,
-    /// `"vae.decoder."` for a full model checkpoint).
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`VaeDecoderError`] if the file cannot be read, the config is
-    /// invalid, or any required weight key is missing.
-    pub fn load(
-        path: &Path,
-        config: &DecoderConfig,
-        key_prefix: &str,
-        device: &B::Device,
-    ) -> Result<Self, VaeDecoderError> {
-        let bytes = std::fs::read(path).map_err(|e| VaeDecoderError::InvalidArgument {
-            detail: format!("cannot read {}: {e}", path.display()),
-        })?;
-        let st = SafeTensors::deserialize(&bytes)?;
-        Self::from_safetensors(&st, config, key_prefix, device)
-    }
-
-    /// Build from an already-open safetensors archive.
+    /// `scope` must point at the decoder root — an empty prefix for a fixture
+    /// saved with `module.state_dict()`, or a scope returned by
+    /// `store.scope("")` with `KeyMap::video_decoder()` for a full checkpoint.
     ///
     /// # Errors
     ///
-    /// Returns a [`VaeDecoderError`] if the config is invalid or a required
+    /// Returns a [`VaeDecoderError`] if the config is invalid or any required
     /// weight key is missing.
     #[expect(
         clippy::too_many_lines,
-        reason = "checkpoint key mapping is kept linear so field names stay auditable against safetensors"
+        reason = "each weight key listed explicitly so names are auditable against the Python state dict"
     )]
-    pub fn from_safetensors(
-        st: &SafeTensors<'_>,
+    pub fn load(
+        scope: &ltx_weights::Scope<'_>,
         config: &DecoderConfig,
-        prefix: &str,
         device: &B::Device,
     ) -> Result<Self, VaeDecoderError> {
         config.validate()?;
         let rope_split = config.rope_dim_split_resolved()?;
-        let p = |s: &str| format!("{prefix}{s}");
 
         // ── per_channel_stats ─────────────────────────────────────────────
-        let std_of_means = load_optional_1d(
-            st,
-            &p("per_channel_statistics.std-of-means"),
-            config.in_channels,
-            device,
-            || Tensor::ones([config.in_channels], device),
-        )?;
-        let mean_of_means = load_optional_1d(
-            st,
-            &p("per_channel_statistics.mean-of-means"),
-            config.in_channels,
-            device,
-            || Tensor::zeros([config.in_channels], device),
-        )?;
+        let std_of_means = scope
+            .optional::<B, 1>("per_channel_statistics.std-of-means", device)?
+            .unwrap_or_else(|| Tensor::ones([config.in_channels], device));
+        let mean_of_means = scope
+            .optional::<B, 1>("per_channel_statistics.mean-of-means", device)?
+            .unwrap_or_else(|| Tensor::zeros([config.in_channels], device));
         let per_channel_stats = PerChannelStatistics {
             std_of_means,
             mean_of_means,
         };
 
         // ── conv_in ───────────────────────────────────────────────────────
-        let c0 = config.stage_channels.first().copied().unwrap_or(128);
-        let conv_in = build_linear(st, &p("conv_in"), config.in_channels, c0, true, device)?;
+        let conv_in = scope_linear(&scope.scope("conv_in"), device)?;
 
-        // ── type_emb ──────────────────────────────────────────────────────
-        let type_emb_val = load_optional_1d(st, &p("type_emb"), c0, device, || {
-            Tensor::zeros([c0], device)
-        })?;
+        // ── type_emb: required (KeyMap::video_decoder synthesises zeros for
+        //   pre-keyframe checkpoints; mis-keyed stores must not silently decode) ──
+        let type_emb_val: Tensor<B, 1> = scope.tensor("type_emb", device)?;
         let type_emb = Param::from_tensor(type_emb_val);
 
         // ── deterministic stages ──────────────────────────────────────────
-        let det_stage1 = load_na_stage(st, prefix, 0, config, rope_split, device)?;
-        let det_stage2 = load_na_stage(st, prefix, 1, config, rope_split, device)?;
-        let det_stage3 = load_na_stage(st, prefix, 2, config, rope_split, device)?;
-        let det_stage4 = load_na_stage(st, prefix, 3, config, rope_split, device)?;
+        let det_stage1 = scope_na_stage(scope, 0, config, rope_split, device)?;
+        let det_stage2 = scope_na_stage(scope, 1, config, rope_split, device)?;
+        let det_stage3 = scope_na_stage(scope, 2, config, rope_split, device)?;
+        let det_stage4 = scope_na_stage(scope, 3, config, rope_split, device)?;
 
         // ── upsamples ─────────────────────────────────────────────────────
-        let up1 = load_upsample(st, prefix, 0, config, device)?;
-        let up2 = load_upsample(st, prefix, 1, config, device)?;
-        let up3 = load_upsample(st, prefix, 2, config, device)?;
-        let up4 = load_upsample(st, prefix, 3, config, device)?;
+        let up1 = scope_upsample(scope, 0, config, device)?;
+        let up2 = scope_upsample(scope, 1, config, device)?;
+        let up3 = scope_upsample(scope, 2, config, device)?;
+        let up4 = scope_upsample(scope, 3, config, device)?;
 
         // ── t_embedder ────────────────────────────────────────────────────
-        let t_emb_dim = config.t_emb_dim;
-        let te = "t_embedder.timestep_embedder.";
-        let l1 = build_linear(
-            st,
-            &p(&format!("{te}linear_1")),
-            256,
-            t_emb_dim,
-            true,
-            device,
-        )?;
-        let l2 = build_linear(
-            st,
-            &p(&format!("{te}linear_2")),
-            t_emb_dim,
-            t_emb_dim,
-            true,
-            device,
-        )?;
+        let te_scope = scope.scope("t_embedder.timestep_embedder");
+        let l1 = scope_linear(&te_scope.scope("linear_1"), device)?;
+        let l2 = scope_linear(&te_scope.scope("linear_2"), device)?;
         let t_embedder = PixArtEmbeddings {
             timestep_embedder: TimestepEmbedding {
                 linear_1: l1,
                 linear_2: l2,
             },
+            // 256 is the fixed sinusoidal projection width in PixArtAlpha (not config-driven).
             num_channels: 256,
         };
 
         // ── shared_adaln ──────────────────────────────────────────────────
         let c5 = config.stage5_channels_resolved();
-        let adaln_out = crate::nn::adaln::NUM_CHUNKS.saturating_mul(c5);
-        let adaln_proj = build_linear(
-            st,
-            &p("shared_adaln.proj"),
-            t_emb_dim,
-            adaln_out,
-            true,
-            device,
-        )?;
+        let adaln_proj = scope_linear(&scope.scope("shared_adaln.proj"), device)?;
         let shared_adaln = AdaLnZero { proj: adaln_proj };
 
         // ── conv_in_x_t ───────────────────────────────────────────────────
-        let noised_ch = config
-            .out_channels
-            .saturating_mul(config.patch_size.saturating_mul(config.patch_size));
-        let conv_in_x_t = build_linear(st, &p("conv_in_x_t"), noised_ch, c5, true, device)?;
+        let conv_in_x_t = scope_linear(&scope.scope("conv_in_x_t"), device)?;
 
         // ── diff_blocks ───────────────────────────────────────────────────
-        let d5 = config.stage_depths.last().copied().unwrap_or(8);
+        // validate() guarantees stage_depths and stage_channels are non-empty.
+        let d5 =
+            config
+                .stage_depths
+                .last()
+                .copied()
+                .ok_or_else(|| VaeDecoderError::InvalidConfig {
+                    detail: "stage_depths is empty after validate".to_owned(),
+                })?;
         let stage5_kernel = config.stage5_kernel;
-        let n_det = config.stage_channels.len().saturating_sub(1);
-        let c_ctx = config
-            .stage_channels
-            .get(n_det.saturating_sub(1))
-            .copied()
-            .unwrap_or(128);
+        // context_channels = stage_channels.last() (Python: stage_channels[-1])
+        let c_ctx = config.stage_channels.last().copied().ok_or_else(|| {
+            VaeDecoderError::InvalidConfig {
+                detail: "stage_channels is empty after validate".to_owned(),
+            }
+        })?;
         let mut diff_blocks = Vec::with_capacity(d5);
         for bi in 0..d5 {
-            let bp = format!("diff_blocks.{bi}.");
-            diff_blocks.push(load_diff_block(
-                st,
-                prefix,
-                &bp,
+            diff_blocks.push(scope_diff_block(
+                &scope.scope(&format!("diff_blocks.{bi}")),
                 c5,
                 c_ctx,
                 stage5_kernel,
@@ -568,8 +514,8 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
         }
 
         // ── norm_out + conv_out ───────────────────────────────────────────
-        let norm_out = build_rms_norm(st, &p("norm_out"), c5, device)?;
-        let conv_out = build_linear(st, &p("conv_out"), c5, noised_ch, true, device)?;
+        let norm_out = scope_rms_norm(&scope.scope("norm_out"), device)?;
+        let conv_out = scope_linear(&scope.scope("conv_out"), device)?;
 
         // ── config fields ─────────────────────────────────────────────────
         let up4_stride = config.upsamples.get(3).map_or([1, 1, 1], |u| u.stride);
@@ -618,7 +564,7 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
     }
 }
 
-// ─── Weight-loading helpers ───────────────────────────────────────────────────
+// ─── Stride helpers (used by load and tests) ──────────────────────────────────
 
 fn cumulative_upsample_stride(upsamples: &[UpsampleSpec], count: usize) -> [usize; 3] {
     upsamples
@@ -647,77 +593,48 @@ fn cumulative_temporal_drop(upsamples: &[UpsampleSpec], count: usize) -> usize {
         })
 }
 
-fn load_optional_1d<B: Backend>(
-    st: &SafeTensors<'_>,
-    key: &str,
-    expected_len: usize,
-    device: &B::Device,
-    fallback: impl FnOnce() -> Tensor<B, 1>,
-) -> Result<Tensor<B, 1>, VaeDecoderError> {
-    match load_1d(st, key, device) {
-        Ok(tensor) => {
-            let [actual_len] = tensor.dims();
-            if actual_len == expected_len {
-                Ok(tensor)
-            } else {
-                Err(VaeDecoderError::ShapeMismatch {
-                    key: key.to_owned(),
-                    expected: vec![expected_len],
-                    actual: vec![actual_len],
-                })
-            }
-        }
-        Err(VaeDecoderError::KeyNotFound { .. }) => Ok(fallback()),
-        Err(err) => Err(err),
-    }
-}
+// ─── Scope-based weight-loading helpers ───────────────────────────────────────
 
-fn build_linear<B: Backend>(
-    st: &SafeTensors<'_>,
-    prefix: &str,
-    d_in: usize,
-    d_out: usize,
-    with_bias: bool,
+/// Load a `Linear` layer from `scope`; transposes weight from `[out, in]` to `[in, out]`.
+fn scope_linear<B: Backend>(
+    scope: &ltx_weights::Scope<'_>,
     device: &B::Device,
 ) -> Result<nn::Linear<B>, VaeDecoderError> {
-    let w = load_linear_weight(st, &format!("{prefix}.weight"), device)?;
-    let b_opt: Option<Tensor<B, 1>> = if with_bias {
-        load_1d(st, &format!("{prefix}.bias"), device).ok()
-    } else {
-        None
-    };
+    let w: Tensor<B, 2> = scope.tensor("weight", device)?;
+    let [d_out, d_in] = w.dims();
+    let w = w.swap_dims(0, 1); // PyTorch [out, in] → Burn [in, out]
+    let bias_opt: Option<Tensor<B, 1>> = scope.optional("bias", device)?;
+    let with_bias = bias_opt.is_some();
     let mut linear = nn::LinearConfig::new(d_in, d_out)
         .with_bias(with_bias)
         .init(device);
     linear.weight = Param::from_tensor(w);
-    if let Some(bias) = b_opt {
+    if let Some(bias) = bias_opt {
         linear.bias = Some(Param::from_tensor(bias));
     }
     Ok(linear)
 }
 
-fn build_rms_norm<B: Backend>(
-    st: &SafeTensors<'_>,
-    prefix: &str,
-    dim: usize,
+/// Load an `RmsNorm` from `scope.weight`.
+fn scope_rms_norm<B: Backend>(
+    scope: &ltx_weights::Scope<'_>,
     device: &B::Device,
 ) -> Result<nn::RmsNorm<B>, VaeDecoderError> {
-    let w = load_1d(st, &format!("{prefix}.weight"), device)?;
+    let w: Tensor<B, 1> = scope.tensor("weight", device)?;
+    let [dim] = w.dims();
     let mut norm = nn::RmsNormConfig::new(dim).with_epsilon(1e-6).init(device);
     norm.gamma = Param::from_tensor(w);
     Ok(norm)
 }
 
-fn build_swiglu<B: Backend>(
-    st: &SafeTensors<'_>,
-    prefix: &str,
-    dim: usize,
-    hidden: usize,
+/// Load a `SwiGlu` MLP from `scope.{w_up,w_gate,w_down}`.
+fn scope_swiglu<B: Backend>(
+    scope: &ltx_weights::Scope<'_>,
     device: &B::Device,
 ) -> Result<SwiGlu<B>, VaeDecoderError> {
-    let w_up = build_linear(st, &format!("{prefix}w_up"), dim, hidden, false, device)?;
-    let w_gate = build_linear(st, &format!("{prefix}w_gate"), dim, hidden, false, device)?;
-    let w_down = build_linear(st, &format!("{prefix}w_down"), hidden, dim, false, device)?;
+    let w_up = scope_linear(&scope.scope("w_up"), device)?;
+    let w_gate = scope_linear(&scope.scope("w_gate"), device)?;
+    let w_down = scope_linear(&scope.scope("w_down"), device)?;
     Ok(SwiGlu {
         w_up,
         w_gate,
@@ -725,9 +642,9 @@ fn build_swiglu<B: Backend>(
     })
 }
 
-fn build_na_attn<B: Backend>(
-    st: &SafeTensors<'_>,
-    prefix: &str,
+/// Load `NeighborhoodAttention3D` from `scope.{qkv.to_{q,k,v},proj,q_norm,k_norm}`.
+fn scope_na_attn<B: Backend>(
+    scope: &ltx_weights::Scope<'_>,
     dim: usize,
     kernel: [usize; 3],
     head_dim: usize,
@@ -735,12 +652,13 @@ fn build_na_attn<B: Backend>(
     device: &B::Device,
 ) -> Result<NeighborhoodAttention3D<B>, VaeDecoderError> {
     let num_heads = dim.checked_div(head_dim).unwrap_or(1);
-    let to_q = build_linear(st, &format!("{prefix}qkv.to_q"), dim, dim, true, device)?;
-    let to_k = build_linear(st, &format!("{prefix}qkv.to_k"), dim, dim, true, device)?;
-    let to_v = build_linear(st, &format!("{prefix}qkv.to_v"), dim, dim, true, device)?;
-    let proj = build_linear(st, &format!("{prefix}proj"), dim, dim, true, device)?;
-    let q_norm = build_rms_norm(st, &format!("{prefix}q_norm"), head_dim, device)?;
-    let k_norm = build_rms_norm(st, &format!("{prefix}k_norm"), head_dim, device)?;
+    let qkv = scope.scope("qkv");
+    let to_q = scope_linear(&qkv.scope("to_q"), device)?;
+    let to_k = scope_linear(&qkv.scope("to_k"), device)?;
+    let to_v = scope_linear(&qkv.scope("to_v"), device)?;
+    let proj = scope_linear(&scope.scope("proj"), device)?;
+    let q_norm = scope_rms_norm(&scope.scope("q_norm"), device)?;
+    let k_norm = scope_rms_norm(&scope.scope("k_norm"), device)?;
     #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
@@ -764,32 +682,26 @@ fn build_na_attn<B: Backend>(
     })
 }
 
-fn load_na_block<B: Backend>(
-    st: &SafeTensors<'_>,
-    prefix: &str,
+/// Load a single `NaBlock` from `scope.{norm1,attn,norm2,mlp}`.
+fn scope_na_block<B: Backend>(
+    scope: &ltx_weights::Scope<'_>,
     dim: usize,
     kernel: [usize; 3],
     head_dim: usize,
     rope_split: [usize; 3],
     device: &B::Device,
 ) -> Result<NaBlock<B>, VaeDecoderError> {
-    let hidden = ((dim.saturating_mul(4))
-        .saturating_add(15)
-        .checked_div(16)
-        .unwrap_or(1))
-    .saturating_mul(16);
-    let norm1 = build_rms_norm(st, &format!("{prefix}norm1"), dim, device)?;
-    let attn = build_na_attn(
-        st,
-        &format!("{prefix}attn."),
+    let norm1 = scope_rms_norm(&scope.scope("norm1"), device)?;
+    let attn = scope_na_attn(
+        &scope.scope("attn"),
         dim,
         kernel,
         head_dim,
         rope_split,
         device,
     )?;
-    let norm2 = build_rms_norm(st, &format!("{prefix}norm2"), dim, device)?;
-    let mlp = build_swiglu(st, &format!("{prefix}mlp."), dim, hidden, device)?;
+    let norm2 = scope_rms_norm(&scope.scope("norm2"), device)?;
+    let mlp = scope_swiglu(&scope.scope("mlp"), device)?;
     Ok(NaBlock {
         norm1,
         attn,
@@ -798,9 +710,9 @@ fn load_na_block<B: Backend>(
     })
 }
 
-fn load_na_stage<B: Backend>(
-    st: &SafeTensors<'_>,
-    global_prefix: &str,
+/// Load all blocks for `det_stages.{stage_idx}.{0..depth}`.
+fn scope_na_stage<B: Backend>(
+    scope: &ltx_weights::Scope<'_>,
     stage_idx: usize,
     config: &DecoderConfig,
     rope_split: [usize; 3],
@@ -815,15 +727,21 @@ fn load_na_stage<B: Backend>(
         .unwrap_or([3, 3, 3]);
     (0..depth)
         .map(|bi| {
-            let bp = format!("{global_prefix}det_stages.{stage_idx}.{bi}.");
-            load_na_block(st, &bp, c, kernel, config.head_dim, rope_split, device)
+            scope_na_block(
+                &scope.scope(&format!("det_stages.{stage_idx}.{bi}")),
+                c,
+                kernel,
+                config.head_dim,
+                rope_split,
+                device,
+            )
         })
         .collect()
 }
 
-fn load_upsample<B: Backend>(
-    st: &SafeTensors<'_>,
-    global_prefix: &str,
+/// Load `upsamples.{idx}.proj`.
+fn scope_upsample<B: Backend>(
+    scope: &ltx_weights::Scope<'_>,
     idx: usize,
     config: &DecoderConfig,
     device: &B::Device,
@@ -838,18 +756,7 @@ fn load_upsample<B: Backend>(
     let c_out = c_in
         .checked_div(up_spec.out_channels_reduction_factor.max(1))
         .unwrap_or(c_in);
-    let proj_out = c_out
-        .saturating_mul(up_spec.stride[0])
-        .saturating_mul(up_spec.stride[1])
-        .saturating_mul(up_spec.stride[2]);
-    let proj = build_linear(
-        st,
-        &format!("{global_prefix}upsamples.{idx}.proj"),
-        c_in,
-        proj_out,
-        true,
-        device,
-    )?;
+    let proj = scope_linear(&scope.scope(&format!("upsamples.{idx}.proj")), device)?;
     Ok(LinearPixelShuffleUpsample {
         proj,
         stride: up_spec.stride,
@@ -857,11 +764,10 @@ fn load_upsample<B: Backend>(
     })
 }
 
+/// Load a `CombinedDiffusionNaBlock` from scope.
 #[allow(clippy::too_many_arguments)]
-fn load_diff_block<B: Backend>(
-    st: &SafeTensors<'_>,
-    global_prefix: &str,
-    block_prefix: &str,
+fn scope_diff_block<B: Backend>(
+    scope: &ltx_weights::Scope<'_>,
     dim: usize,
     context_channels: usize,
     kernel: [usize; 3],
@@ -869,34 +775,21 @@ fn load_diff_block<B: Backend>(
     rope_split: [usize; 3],
     device: &B::Device,
 ) -> Result<CombinedDiffusionNaBlock<B>, VaeDecoderError> {
-    let hidden = ((dim.saturating_mul(4))
-        .saturating_add(15)
-        .checked_div(16)
-        .unwrap_or(1))
-    .saturating_mul(16);
-    let pfx = format!("{global_prefix}{block_prefix}");
-    let context_proj = build_linear(
-        st,
-        &format!("{pfx}context_proj"),
-        context_channels,
-        dim,
-        true,
-        device,
-    )?;
-    let sst: Tensor<B, 2> = load_2d_raw(st, &format!("{pfx}scale_shift_table"), device)?;
+    let context_proj = scope_linear(&scope.scope("context_proj"), device)?;
+    // scale_shift_table is a raw parameter, not a Linear weight — do NOT transpose.
+    let sst: Tensor<B, 2> = scope.tensor("scale_shift_table", device)?;
     let scale_shift_table = Param::from_tensor(sst);
-    let norm1 = build_rms_norm(st, &format!("{pfx}norm1"), dim, device)?;
-    let attn = build_na_attn(
-        st,
-        &format!("{pfx}attn."),
+    let norm1 = scope_rms_norm(&scope.scope("norm1"), device)?;
+    let attn = scope_na_attn(
+        &scope.scope("attn"),
         dim,
         kernel,
         head_dim,
         rope_split,
         device,
     )?;
-    let norm2 = build_rms_norm(st, &format!("{pfx}norm2"), dim, device)?;
-    let mlp = build_swiglu(st, &format!("{pfx}mlp."), dim, hidden, device)?;
+    let norm2 = scope_rms_norm(&scope.scope("norm2"), device)?;
+    let mlp = scope_swiglu(&scope.scope("mlp"), device)?;
     Ok(CombinedDiffusionNaBlock {
         context_proj,
         scale_shift_table,

@@ -4,15 +4,15 @@
 //!
 //! ```rust,ignore
 //! use ltx_vae_decoder::{DecoderConfig, DiffusionVideoDecoder};
-//! use burn::tensor::backend::Backend;
+//! use ltx_weights::{KeyMap, WeightStore};
+//! use burn::backend::NdArray;
 //!
-//! // Build from a parity fixture / checkpoint.
-//! let decoder = DiffusionVideoDecoder::<B>::load(
-//!     &path_to_safetensors,
-//!     &config,
-//!     "",          // key prefix
-//!     &device,
-//! )?;
+//! // Open checkpoint with decoder key-map and build a scope.
+//! let store = WeightStore::open(&["checkpoint.safetensors"], &KeyMap::video_decoder())?;
+//! let scope = store.scope("");
+//!
+//! // Build decoder from a parity fixture (scope at empty prefix).
+//! let decoder = DiffusionVideoDecoder::<NdArray>::load(&scope, &config, &device)?;
 //!
 //! // Decode a latent (with explicit noise for determinism in tests).
 //! let pixels = decoder.decode(latent, Some(noise), &device)?;
@@ -38,7 +38,6 @@
 pub mod config;
 pub mod decoder;
 pub mod error;
-pub mod load;
 pub mod na3d;
 pub mod nn;
 pub mod ops;
