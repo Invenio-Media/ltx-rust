@@ -3209,6 +3209,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ltx-pipeline"
+version = "0.1.0"
+dependencies = [
+ "ltx-backend",
+ "ltx-chunk",
+ "ltx-io",
+ "ltx-shape",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ltx-sampler"
 version = "0.1.0"
 dependencies = [

@@ -19,6 +19,11 @@ alpha matte.
 | `ltx-chunk` | Temporal/spatial chunk planning, reflection padding, smoothstep blend, seam conditioning |
 | `ltx-io` | ffprobe metadata, ffmpeg frame decode, EXR matte write, preview encode |
 | `ltx-backend` | `AlphaBackend` trait and Python backend (JSON-lines over stdio) |
+| `ltx-sampler` | Euler denoising schedule and classifier-free guidance protocol |
+| `ltx-vae` | Diffusion-video VAE encoder modules |
+| `ltx-dit` | LTX video transformer modules |
+| `ltx-vae-decoder` | Diffusion-video VAE decoder modules |
+| `ltx-pipeline` | End-to-end chunk orchestration from video input to EXR matte output |
 
 ## Checks
 
