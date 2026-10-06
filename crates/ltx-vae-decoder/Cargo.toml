@@ -1,0 +1,28 @@
+[package]
+name = "ltx-vae-decoder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LTX-2.5 diffusion video VAE decoder in Burn."
+
+[features]
+default = []
+metal = ["burn/metal"]
+cuda = ["burn/cuda"]
+
+[dependencies]
+burn = { workspace = true, features = ["ndarray"] }
+thiserror.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+half.workspace = true
+ltx-shape = { path = "../ltx-shape" }
+
+[dev-dependencies]
+burn = { workspace = true, features = ["ndarray"] }
+
+[lints]
+workspace = true
