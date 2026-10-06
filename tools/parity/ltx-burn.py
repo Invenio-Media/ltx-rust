@@ -50,26 +50,27 @@ LTX2_COMMIT = "9ec55f9"
 # Encoder: patch_size=1, compress_time × 1, compress_space × 1
 #   → temporal_factor = 2, spatial_factor = 2, latent_channels = 4
 #
-# Target video: 3 frames, 4×4 pixels → latent [1, 4, 2, 2, 2] = 8 tokens
+# Target video: 3 frames, 8×8 pixels → latent [1, 4, 2, 4, 4] = 32 tokens
 #
-# LoRA: reference_temporal_scale_factor = 2, reference_downscale_factor = 1
-#   Ref video: temporal subsample → 2 pixel frames → 1 latent frame
+# LoRA: reference_temporal_scale_factor = 2, reference_downscale_factor = 2
+#   Ref video: bilinear resize 8×8 → 4×4, temporal subsample → 2 pixel frames
+#   → 1 latent frame, spatial 4×4 → 2×2 with spatial_factor=2
 #   → ref_latent [1, 4, 1, 2, 2] = 4 ref tokens
-#   → total = 12 tokens
+#   → total = 36 tokens
 # ---------------------------------------------------------------------------
 PIXEL_F = 3
-PIXEL_H = 4
-PIXEL_W = 4
+PIXEL_H = 8
+PIXEL_W = 8
 LAT_C = 4
 LAT_F = 2        # (3-1)//2 + 1
-LAT_H = 2        # 4 // 2
-LAT_W = 2        # 4 // 2
-TARGET_TOKENS = LAT_F * LAT_H * LAT_W   # 8
+LAT_H = 4        # 8 // 2
+LAT_W = 4        # 8 // 2
+TARGET_TOKENS = LAT_F * LAT_H * LAT_W   # 32
 REF_TS = 2       # reference_temporal_scale_factor (LoRA metadata)
-REF_DS = 1       # reference_downscale_factor
+REF_DS = 2       # reference_downscale_factor
 REF_LAT_F = 1   # ref latent frames after temporal subsample + VAE encode
-REF_TOKENS = REF_LAT_F * LAT_H * LAT_W  # 4
-TOTAL_TOKENS = TARGET_TOKENS + REF_TOKENS  # 12
+REF_TOKENS = REF_LAT_F * (LAT_H // REF_DS) * (LAT_W // REF_DS)  # 4
+TOTAL_TOKENS = TARGET_TOKENS + REF_TOKENS  # 36
 KF_STRENGTH = 0.95
 FPS = 24.0
 NUM_STEPS = 2
@@ -342,10 +343,22 @@ def run_pipeline(enc, dec, transformer):
 
     with torch.no_grad():
         # ── step 1: reference VAE encode ─────────────────────────────────────
+        import torch.nn.functional as F  # noqa: PLC0415
         ref_indices = [0] + list(range(1, PIXEL_F, REF_TS))  # [0, 1]
         ref_rgb = rgb[:, :, ref_indices]      # [1, 3, 2, H, W]
+        if REF_DS > 1:
+            # Bilinear resize from (PIXEL_H, PIXEL_W) → (PIXEL_H//REF_DS, PIXEL_W//REF_DS)
+            # matching Rust resize_and_center_crop_5d (align_corners=False).
+            ref_h_pix = PIXEL_H // REF_DS
+            ref_w_pix = PIXEL_W // REF_DS
+            ref_rgb_4d = ref_rgb.squeeze(0).permute(1, 0, 2, 3)  # [F, 3, H, W]
+            ref_rgb_small = F.interpolate(
+                ref_rgb_4d.float(), size=(ref_h_pix, ref_w_pix),
+                mode='bilinear', align_corners=False
+            )
+            ref_rgb = ref_rgb_small.permute(1, 0, 2, 3).unsqueeze(0)  # [1, 3, F, h, w]
         ref_latent = enc(ref_rgb)              # [1, 4, 1, 2, 2]
-        assert ref_latent.shape == (1, LAT_C, REF_LAT_F, LAT_H, LAT_W), (
+        assert ref_latent.shape == (1, LAT_C, REF_LAT_F, LAT_H // REF_DS, LAT_W // REF_DS), (
             f"unexpected ref_latent shape {ref_latent.shape}"
         )
 
@@ -359,14 +372,14 @@ def run_pipeline(enc, dec, transformer):
 
         target_tokens = patchify5d(torch.zeros(1, LAT_C, LAT_F, LAT_H, LAT_W))
         ref_tokens = patchify5d(ref_latent)
-        kf_tokens = patchify5d(kf_latent)   # [1, 4, 4] (1 frame × 2×2)
-        TPS = LAT_H * LAT_W  # tokens per frame = 4
+        kf_tokens = patchify5d(kf_latent)   # [1, 16, 4] (1 frame × 4×4)
+        TPS = LAT_H * LAT_W  # target tokens per frame = 16
 
         # ── step 4: positions ─────────────────────────────────────────────────
         time_scale = 2  # temporal_factor
         hw_scale = 2    # spatial_factor
         target_pos = make_positions(LAT_F, LAT_H, LAT_W, time_scale, hw_scale, FPS)
-        ref_pos = make_ref_positions(REF_LAT_F, LAT_H, LAT_W,
+        ref_pos = make_ref_positions(REF_LAT_F, LAT_H // REF_DS, LAT_W // REF_DS,
                                      time_scale, hw_scale, FPS, REF_TS, REF_DS)
 
         # ── step 5: initial LatentState ───────────────────────────────────────
@@ -378,10 +391,10 @@ def run_pipeline(enc, dec, transformer):
         ref_mask = torch.zeros(1, REF_TOKENS, 1)
         ref_latent_zeros = torch.zeros(1, REF_TOKENS, LAT_C)
 
-        all_lat = torch.cat([target_tokens, ref_latent_zeros], 1)  # [1,12,4]
-        all_mask = torch.cat([denoise_mask, ref_mask], 1)           # [1,12,1]
-        all_pos = torch.cat([target_pos, ref_pos], 2)               # [1,3,12,2]
-        all_clean = torch.cat([clean_latent, ref_tokens], 1)        # [1,12,4]
+        all_lat = torch.cat([target_tokens, ref_latent_zeros], 1)  # [1,36,4]
+        all_mask = torch.cat([denoise_mask, ref_mask], 1)           # [1,36,1]
+        all_pos = torch.cat([target_pos, ref_pos], 2)               # [1,3,36,2]
+        all_clean = torch.cat([clean_latent, ref_tokens], 1)        # [1,36,4]
 
         # ── step 7: ImageKeyframeCondition (frame 0, strength=0.95) ──────────
         # PR #17: mask = state.denoise_mask * keep + frame_mask * (1 - strength)

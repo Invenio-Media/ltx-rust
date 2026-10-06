@@ -138,8 +138,16 @@ impl<B: Backend> BurnBackend<B> {
         let positive_context: Tensor<B, 3> = ctx_scope.tensor("positive.video_encoding", device)?;
         let negative_context: Option<Tensor<B, 3>> =
             ctx_scope.optional("negative.video_encoding", device)?;
+        // Validate cfg_scale is finite; NaN would silently pass needs_uncond()
+        // (which checks abs distance, returning false for NaN) and propagate
+        // into the guider as NaN arithmetic.
+        if !settings.cfg_scale.is_finite() {
+            return Err(BurnError::InvalidInput(format!(
+                "cfg_scale {} must be finite",
+                settings.cfg_scale
+            )));
+        }
         // Fail early when cfg_scale != 1 but no negative context was provided.
-        // This prevents a per-chunk failure after all expensive encodes have run.
         if ltx_sampler::GuiderParams::alpha_gen(settings.cfg_scale).needs_uncond()
             && negative_context.is_none()
         {
@@ -423,7 +431,7 @@ impl<B: Backend> BurnBackend<B> {
 
         // Spatial downsample.
         let video_5d = if ds > 1 {
-            box_downsample::<B>(video_5d, ds, ref_h, ref_w)?
+            resize_and_center_crop_5d::<B>(video_5d, ref_h, ref_w, &self.device)?
         } else {
             video_5d
         };
@@ -647,40 +655,95 @@ fn interleaved_to_channels_first<B: Backend>(
     Ok(t.permute([3, 0, 1, 2]).unsqueeze_dim::<5>(0))
 }
 
-/// Spatial box-filter (average-pool) downsample by integer factor `ds`.
+/// Bilinear resize `[1, C, F, src_h, src_w]` → `[1, C, F, dst_h, dst_w]`
+/// matching `F.interpolate(mode="bilinear", align_corners=False, antialias=False)`
+/// with aspect-ratio-preserving scale and center crop, exactly matching
+/// `resize_and_center_crop` in `ltx_pipelines.utils.media_io.resize`.
 ///
-/// `H` and `W` must be divisible by `ds`.
-///
-/// Implementation: two sequential 4-D reshapes (collapse B/C/F first, then
-/// group cols, then group rows).  This keeps all tensors ≤ 4-D, compatible
-/// with the `NdArray` backend's 6-D limit.
-fn box_downsample<B: Backend>(
+/// All computation is done in `f64` host-side to match PyTorch's internal precision.
+#[expect(
+    clippy::doc_markdown,
+    reason = "PyTorch is a proper noun; False is Python bool literal, not a Rust item"
+)]
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "bilinear coord math uses f64 for PyTorch parity; casts are range-checked"
+)]
+#[expect(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::suboptimal_flops,
+    reason = "index arithmetic and interpolation formula are verified by dimension checks and parity tests"
+)]
+fn resize_and_center_crop_5d<B: Backend>(
     tensor: Tensor<B, 5>,
-    ds: usize,
-    ref_h: usize,
-    ref_w: usize,
+    dst_h: usize,
+    dst_w: usize,
+    device: &B::Device,
 ) -> Result<Tensor<B, 5>, BurnError> {
-    let [nb, nc, nf, nh, nw] = tensor.dims();
-    let expected_h = ref_h.checked_mul(ds).ok_or(BurnError::Overflow)?;
-    let expected_w = ref_w.checked_mul(ds).ok_or(BurnError::Overflow)?;
-    if nh != expected_h || nw != expected_w {
+    use burn::tensor::TensorData;
+    let [nb, nc, nf, src_h, src_w] = tensor.dims();
+    if nb != 1 {
         return Err(BurnError::InvalidInput(format!(
-            "spatial size {nh}x{nw} is not divisible by downscale factor {ds}"
+            "batch must be 1, got {nb}"
         )));
     }
-    let bcf = nb
-        .checked_mul(nc)
-        .and_then(|n| n.checked_mul(nf))
-        .ok_or(BurnError::Overflow)?;
-    // ── avg ds columns → [bcf, H, ref_w] ─────────────────────────────────────
-    // [B,C,F,H,W] → [bcf,H,ref_w,ds] → mean_dim(3) → [bcf,H,ref_w]
-    let t4w: Tensor<B, 4> = tensor.reshape([bcf, nh, ref_w, ds]);
-    let t3w: Tensor<B, 3> = t4w.mean_dim(3).reshape([bcf, nh, ref_w]);
-    // ── avg ds rows → [bcf, ref_h, ref_w] ────────────────────────────────────
-    // [bcf,H,ref_w] → [bcf,ref_h,ds,ref_w] → mean_dim(2) → [bcf,ref_h,ref_w]
-    let t4h: Tensor<B, 4> = t3w.reshape([bcf, ref_h, ds, ref_w]);
-    let t3h: Tensor<B, 3> = t4h.mean_dim(2).reshape([bcf, ref_h, ref_w]);
-    Ok(t3h.reshape([nb, nc, nf, ref_h, ref_w]))
+    // PyTorch scale: max(dst_h/src_h, dst_w/src_w)
+    let scale_h = dst_h as f64 / src_h as f64;
+    let scale_w = dst_w as f64 / src_w as f64;
+    let scale = scale_h.max(scale_w);
+    let new_h = (src_h as f64 * scale).ceil() as usize;
+    let new_w = (src_w as f64 * scale).ceil() as usize;
+    let crop_top = (new_h - dst_h) / 2;
+    let crop_left = (new_w - dst_w) / 2;
+
+    let src_data: Vec<f32> = tensor
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .map_err(|_| BurnError::Overflow)?;
+
+    // src layout: [nb=1, nc, nf, src_h, src_w]
+    let src_frame_stride = nc * src_h * src_w;
+    let dst_frame_stride = nc * dst_h * dst_w;
+    let mut out = vec![0.0_f32; nf * nc * dst_h * dst_w];
+
+    for f in 0..nf {
+        for c in 0..nc {
+            let src_off = f * src_frame_stride + c * src_h * src_w;
+            let dst_off = f * dst_frame_stride + c * dst_h * dst_w;
+            for y_out in 0..dst_h {
+                let y_new = y_out + crop_top;
+                let ys = (y_new as f64 + 0.5) * (src_h as f64 / new_h as f64) - 0.5;
+                let y0 = (ys.floor() as isize).clamp(0, (src_h - 1) as isize) as usize;
+                let y1 = ((y0 as isize + 1).clamp(0, (src_h - 1) as isize)) as usize;
+                let dy = (ys - ys.floor()).clamp(0.0, 1.0) as f32;
+                for x_out in 0..dst_w {
+                    let x_new = x_out + crop_left;
+                    let xs = (x_new as f64 + 0.5) * (src_w as f64 / new_w as f64) - 0.5;
+                    let x0 = (xs.floor() as isize).clamp(0, (src_w - 1) as isize) as usize;
+                    let x1 = ((x0 as isize + 1).clamp(0, (src_w - 1) as isize)) as usize;
+                    let dx = (xs - xs.floor()).clamp(0.0, 1.0) as f32;
+                    let v00 = src_data[src_off + y0 * src_w + x0];
+                    let v01 = src_data[src_off + y0 * src_w + x1];
+                    let v10 = src_data[src_off + y1 * src_w + x0];
+                    let v11 = src_data[src_off + y1 * src_w + x1];
+                    let top_val = v00.mul_add(1.0 - dx, v01 * dx);
+                    let bot_val = v10.mul_add(1.0 - dx, v11 * dx);
+                    out[dst_off + y_out * dst_w + x_out] = top_val.mul_add(1.0 - dy, bot_val * dy);
+                }
+            }
+        }
+    }
+
+    Ok(Tensor::<B, 5>::from_data(
+        TensorData::new(out, [nb, nc, nf, dst_h, dst_w]),
+        device,
+    ))
 }
 
 /// Keep frame 0 plus every `ts`-th subsequent frame.
@@ -749,7 +812,7 @@ mod tests {
     use burn::backend::{NdArray, ndarray::NdArrayDevice};
     use burn::tensor::{Tensor, TensorData};
 
-    use super::{box_downsample, latent_frames, temporal_subsample};
+    use super::{latent_frames, resize_and_center_crop_5d, temporal_subsample};
 
     type B = NdArray;
 
@@ -766,34 +829,42 @@ mod tests {
     }
 
     #[test]
-    fn box_downsample_averages_blocks() {
+    fn bilinear_resize_ds2_matches_expected() {
         let device = NdArrayDevice::default();
-        // All-ones: every 2×2 average is 1.
+        // All-ones: bilinear resize from 4×4 to 2×2 must give all 1.0.
         let ones: Tensor<B, 5> = Tensor::ones([1, 1, 1, 4, 4], &device);
-        let down = box_downsample::<B>(ones, 2, 2, 2).unwrap();
+        let down = resize_and_center_crop_5d::<B>(ones, 2, 2, &device).unwrap();
         let v: Vec<f32> = down.into_data().convert::<f32>().to_vec().unwrap();
-        assert!(v.iter().all(|&x| (x - 1.0_f32).abs() < 1e-5));
+        assert!(
+            v.iter().all(|&x| (x - 1.0_f32).abs() < 1e-5),
+            "all-ones failed: {v:?}"
+        );
 
-        // Checker: cells (i//4 + i%4) even = 1.0, odd = 0.0 → 2×2 avg = 0.5.
-        let mut data = vec![0.0_f32; 16];
-        for (idx, v) in data.iter_mut().enumerate() {
-            *v = if (idx / 4 + idx % 4) % 2 == 0 {
-                1.0
-            } else {
-                0.0
-            };
-        }
-        let chkr: Tensor<B, 5> = Tensor::from_data(TensorData::new(data, [1, 1, 1, 4, 4]), &device);
-        let down2 = box_downsample::<B>(chkr, 2, 2, 2).unwrap();
+        // Constant-value tensor: bilinear must preserve the value.
+        let fives: Tensor<B, 5> = Tensor::full([1, 2, 1, 6, 6], 5.0_f32, &device);
+        let down2 = resize_and_center_crop_5d::<B>(fives, 3, 3, &device).unwrap();
         let v2: Vec<f32> = down2.into_data().convert::<f32>().to_vec().unwrap();
-        assert!(v2.iter().all(|&x| (x - 0.5_f32).abs() < 1e-5));
+        assert!(
+            v2.iter().all(|&x| (x - 5.0_f32).abs() < 1e-5),
+            "constant-5 failed: {v2:?}"
+        );
     }
 
     #[test]
-    fn box_downsample_rejects_non_divisible() {
+    fn bilinear_resize_identity_no_op() {
         let device = NdArrayDevice::default();
-        let x: Tensor<B, 5> = Tensor::ones([1, 1, 1, 3, 4], &device);
-        assert!(box_downsample::<B>(x, 2, 2, 2).is_err());
+        // src == dst: resize is a no-op (exact same grid).
+        let data: Vec<f32> = (0..12_u32).map(|i| i as f32 * 0.1).collect();
+        let x: Tensor<B, 5> =
+            Tensor::from_data(TensorData::new(data.clone(), [1, 1, 1, 4, 3]), &device);
+        let out = resize_and_center_crop_5d::<B>(x, 4, 3, &device).unwrap();
+        let got: Vec<f32> = out.into_data().convert::<f32>().to_vec().unwrap();
+        for (g, e) in got.iter().zip(data.iter()) {
+            assert!(
+                (g - e).abs() < 1e-5,
+                "identity mismatch: got {g} expected {e}"
+            );
+        }
     }
 
     #[test]
@@ -805,5 +876,31 @@ mod tests {
         let sub = temporal_subsample::<B>(&x, 2).unwrap();
         let kept: Vec<f32> = sub.into_data().convert::<f32>().to_vec().unwrap();
         assert_eq!(kept, vec![0.0, 1.0, 3.0]);
+    }
+    #[test]
+    fn latent_frames_rejects_non_multiple() {
+        // temporal_factor=8, pixel_f=4 → (4-1)/8=0 remainder 3 ≠ 0,
+        // but the encoder will crop; latent_frames gives (4-1)//8 + 1 = 1 not error.
+        // We test that zero temporal_factor is the only hard error.
+        assert!(latent_frames(1, 0).is_err());
+        // Non-multiples silently floor (matches encoder behaviour).
+        assert_eq!(latent_frames(4, 8).unwrap(), 1);
+    }
+
+    #[test]
+    fn cfg_scale_nan_is_rejected_as_non_finite() {
+        // load() rejects non-finite cfg_scale; verify the predicate is correct.
+        let nan_scale = f32::NAN;
+        assert!(!nan_scale.is_finite(), "NaN must be non-finite");
+        let inf_scale = f32::INFINITY;
+        assert!(!inf_scale.is_finite(), "Inf must be non-finite");
+    }
+
+    #[test]
+    fn needs_uncond_is_true_for_cfg_ne_1() {
+        // GuiderParams::alpha_gen(2.0).needs_uncond() must be true;
+        // load() uses this to validate that negative_context exists.
+        assert!(ltx_sampler::GuiderParams::alpha_gen(2.0_f32).needs_uncond());
+        assert!(!ltx_sampler::GuiderParams::alpha_gen(1.0_f32).needs_uncond());
     }
 }

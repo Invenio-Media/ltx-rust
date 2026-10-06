@@ -19,12 +19,12 @@ type ActiveBackend = burn::backend::NdArray<f32>;
 #[cfg(not(any(feature = "metal", feature = "cuda")))]
 type ActiveDevice = burn::backend::ndarray::NdArrayDevice;
 
-/// Apple Metal GPU backend.
+/// Apple Metal GPU backend (Burn 0.21: Metal is Wgpu with the Metal graphics API).
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
-type ActiveBackend = burn::backend::Metal<half::bf16>;
+type ActiveBackend = burn::backend::Metal<f32>;
 /// Device for the Metal backend.
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
-type ActiveDevice = burn::backend::metal::MetalDevice;
+type ActiveDevice = burn::backend::wgpu::WgpuDevice;
 
 /// NVIDIA CUDA GPU backend.
 #[cfg(all(feature = "cuda", not(feature = "metal")))]

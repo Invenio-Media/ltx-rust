@@ -11,7 +11,7 @@
 //! and calls `run_chunk_with_noise` to inject the recorded noise for a
 //! deterministic comparison.
 //!
-//! Tolerance: `atol = 5e-3`, `rtol = 5e-2`
+//! Tolerance: `atol = 1e-3`, `rtol = 1e-2`
 
 #![allow(
     clippy::unwrap_used,
@@ -38,8 +38,8 @@ use ltx_weights::{KeyMap, WeightStore};
 
 type B = NdArray;
 
-const ATOL: f32 = 5e-3;
-const RTOL: f32 = 5e-2;
+const ATOL: f32 = 1e-3;
+const RTOL: f32 = 1e-2;
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/parity.safetensors")
