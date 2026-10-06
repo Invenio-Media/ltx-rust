@@ -2,7 +2,7 @@
 //!
 //! See [`crate`] docs for the full pipeline description.
 
-use std::{num::NonZeroU32, path::Path};
+use std::num::NonZeroU32;
 
 use burn::{prelude::Backend, tensor::Tensor};
 use ltx_backend::{AlphaBackend, AlphaChunk, BackendError, Keyframes, MemSample, VideoChunk};
@@ -72,12 +72,37 @@ impl<B: Backend> BurnBackend<B> {
         let transformer_json = t_cfg_json.get("transformer").unwrap_or(&t_cfg_json);
         let dit_config = DiTConfig::from_json(transformer_json)?;
 
-        // ── IC-LoRA: collect scale factors, then merge weights ────────────────
-        let ic_layout = collect_lora_layout(&files.loras)?;
+        // ── IC-LoRA: open each file once; collect layout and merge in one pass ─
+        let mut spatial: Vec<u32> = Vec::new();
+        let mut temporal: Vec<u32> = Vec::new();
         for (path, strength) in &files.loras {
             let lora = LoraFile::open(path)?;
+            let layout = lora.ic_layout()?;
+            let ds = layout.reference_downscale();
+            let ts = layout.reference_temporal();
+            if ds != 1 {
+                spatial.push(ds);
+            }
+            if ts != 1 {
+                temporal.push(ts);
+            }
             t_store.merge_lora(&lora, *strength)?;
         }
+        spatial.sort_unstable();
+        spatial.dedup();
+        temporal.sort_unstable();
+        temporal.dedup();
+        if spatial.len() > 1 {
+            return Err(BurnError::LoraScaleDisagreement { values: spatial });
+        }
+        if temporal.len() > 1 {
+            return Err(BurnError::LoraTemporalDisagreement { values: temporal });
+        }
+        let ic_layout = IcLoraLayout::new(
+            spatial.first().copied().unwrap_or(1),
+            temporal.first().copied().unwrap_or(1),
+        )
+        .map_err(BurnError::Shape)?;
         let transformer = VideoTransformer::<B>::load(&t_store.scope(""), &dit_config, device)?;
 
         // ── video VAE encoder ─────────────────────────────────────────────────
@@ -195,6 +220,10 @@ impl<B: Backend> BurnBackend<B> {
     /// sampling from `GaussianNoiser`.
     /// `decoder_noise`: pixel-canvas noise `[1, C_out, F_pix, H_pix, W_pix]` passed
     /// directly to the decoder.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "each step labelled and ordered to mirror the reference alpha_gen pipeline"
+    )]
     fn run_chunk_impl(
         &self,
         rgb: &VideoChunk,
@@ -212,6 +241,18 @@ impl<B: Backend> BurnBackend<B> {
         let lat_c = self.encoder.latent_channels();
 
         let lat_f = latent_frames(frames, tf)?;
+        // Validate that spatial dims divide exactly — otherwise encoded reference and
+        // target latents disagree on H/W and conditioning shapes become corrupt.
+        if height.checked_rem(sf).ok_or(BurnError::Overflow)? != 0 {
+            return Err(BurnError::InvalidInput(format!(
+                "height {height} must be a multiple of spatial_factor {sf}"
+            )));
+        }
+        if width.checked_rem(sf).ok_or(BurnError::Overflow)? != 0 {
+            return Err(BurnError::InvalidInput(format!(
+                "width {width} must be a multiple of spatial_factor {sf}"
+            )));
+        }
         let lat_h = height.checked_div(sf).ok_or(BurnError::Overflow)?;
         let lat_w = width.checked_div(sf).ok_or(BurnError::Overflow)?;
 
@@ -401,6 +442,12 @@ impl<B: Backend> BurnBackend<B> {
         lat_w: usize,
     ) -> Result<LatentState<B>, BurnError> {
         let Some(kf) = cond else { return Ok(state) };
+        if !kf.strength.is_finite() || !(0.0..=1.0).contains(&kf.strength) {
+            return Err(BurnError::InvalidInput(format!(
+                "Keyframes.strength {} must be finite and in [0, 1]",
+                kf.strength
+            )));
+        }
 
         let kf_count = usize::try_from(kf.frame_count).map_err(|_| BurnError::Overflow)?;
         let kf_h = usize::try_from(kf.height).map_err(|_| BurnError::Overflow)?;
@@ -528,9 +575,15 @@ impl<B: Backend> VideoDenoiserModel<B> for TransformerAdapter<'_, B> {
 /// Compute latent frame count from pixel frames and temporal compression.
 ///
 /// `latent_f = 1 + (pixel_f - 1) / temporal_factor`
+///
+/// # Errors
+/// Returns [`BurnError::InvalidInput`] when `temporal_factor` is zero (an
+/// encoder with a zero temporal factor cannot have been constructed).
 fn latent_frames(pixel_f: usize, temporal_factor: usize) -> Result<usize, BurnError> {
     if temporal_factor == 0 {
-        return Ok(pixel_f);
+        return Err(BurnError::InvalidInput(
+            "encoder temporal_factor is 0; this encoder state is invalid".into(),
+        ));
     }
     pixel_f
         .saturating_sub(1)
@@ -549,40 +602,6 @@ fn encoder_scale(temporal: u32, spatial: u32) -> Result<ScaleFactors, BurnError>
         height,
         width,
     })
-}
-
-/// Read `IC-LoRA` reference layout from `LoRA` file metadata.
-///
-/// Values of 1 mean "unset" and are ignored; any two non-1 values must agree.
-/// Mirrors `_reference_scale_factors` in `alpha_gen.py`.
-fn collect_lora_layout(loras: &[(impl AsRef<Path>, f32)]) -> Result<IcLoraLayout, BurnError> {
-    let mut spatial: Vec<u32> = Vec::new();
-    let mut temporal: Vec<u32> = Vec::new();
-    for (path, _strength) in loras {
-        let lf = LoraFile::open(path.as_ref())?;
-        let layout = lf.ic_layout()?;
-        let ds = layout.reference_downscale();
-        let ts = layout.reference_temporal();
-        if ds != 1 {
-            spatial.push(ds);
-        }
-        if ts != 1 {
-            temporal.push(ts);
-        }
-    }
-    spatial.sort_unstable();
-    spatial.dedup();
-    temporal.sort_unstable();
-    temporal.dedup();
-    if spatial.len() > 1 {
-        return Err(BurnError::LoraScaleDisagreement { values: spatial });
-    }
-    if temporal.len() > 1 {
-        return Err(BurnError::LoraTemporalDisagreement { values: temporal });
-    }
-    let ds = spatial.first().copied().unwrap_or(1);
-    let ts = temporal.first().copied().unwrap_or(1);
-    IcLoraLayout::new(ds, ts).map_err(BurnError::Shape)
 }
 
 /// Convert interleaved RGB `f32` (frame×row×col×channel layout) to
@@ -623,8 +642,10 @@ fn interleaved_to_channels_first<B: Backend>(
 /// Spatial box-filter (average-pool) downsample by integer factor `ds`.
 ///
 /// `H` and `W` must be divisible by `ds`.
-/// Implementation: reshape `H → (ref_h, ds)` and `W → (ref_w, ds)` then
-/// average over the ds-size dims, avoiding any explicit `squeeze`.
+///
+/// Implementation: two sequential 4-D reshapes (collapse B/C/F first, then
+/// group cols, then group rows).  This keeps all tensors ≤ 4-D, compatible
+/// with the `NdArray` backend's 6-D limit.
 fn box_downsample<B: Backend>(
     tensor: Tensor<B, 5>,
     ds: usize,
@@ -639,15 +660,19 @@ fn box_downsample<B: Backend>(
             "spatial size {nh}x{nw} is not divisible by downscale factor {ds}"
         )));
     }
-    // Reshape to 7-D: [B, C, F, ref_h, ds, ref_w, ds]
-    // Average over dims 4 (row-within-block) and 6 (col-within-block).
-    // Keep singletons in place; collapse all at once with the final reshape.
-    let x7: Tensor<B, 7> = tensor.reshape([nb, nc, nf, ref_h, ds, ref_w, ds]);
-    // mean_dim preserves rank (size 1 at the averaged dim).
-    let x7 = x7.mean_dim(6); // avg cols within block: [B,C,F,ref_h,ds,ref_w,1]
-    let x7 = x7.mean_dim(4); // avg rows within block: [B,C,F,ref_h,1,ref_w,1]
-    // Collapse the two singleton dims via reshape.
-    Ok(x7.reshape([nb, nc, nf, ref_h, ref_w]))
+    let bcf = nb
+        .checked_mul(nc)
+        .and_then(|n| n.checked_mul(nf))
+        .ok_or(BurnError::Overflow)?;
+    // ── avg ds columns → [bcf, H, ref_w] ─────────────────────────────────────
+    // [B,C,F,H,W] → [bcf,H,ref_w,ds] → mean_dim(3) → [bcf,H,ref_w]
+    let t4w: Tensor<B, 4> = tensor.reshape([bcf, nh, ref_w, ds]);
+    let t3w: Tensor<B, 3> = t4w.mean_dim(3).reshape([bcf, nh, ref_w]);
+    // ── avg ds rows → [bcf, ref_h, ref_w] ────────────────────────────────────
+    // [bcf,H,ref_w] → [bcf,ref_h,ds,ref_w] → mean_dim(2) → [bcf,ref_h,ref_w]
+    let t4h: Tensor<B, 4> = t3w.reshape([bcf, ref_h, ds, ref_w]);
+    let t3h: Tensor<B, 3> = t4h.mean_dim(2).reshape([bcf, ref_h, ref_w]);
+    Ok(t3h.reshape([nb, nc, nf, ref_h, ref_w]))
 }
 
 /// Keep frame 0 plus every `ts`-th subsequent frame.
@@ -701,4 +726,76 @@ fn pixels_to_alpha<B: Backend>(
         .convert::<f32>()
         .to_vec::<f32>()
         .map_err(|_| BurnError::Overflow)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::float_cmp,
+    clippy::approx_constant,
+    clippy::as_conversions,
+    clippy::cast_precision_loss
+)]
+mod tests {
+    use burn::backend::{NdArray, ndarray::NdArrayDevice};
+    use burn::tensor::{Tensor, TensorData};
+
+    use super::{box_downsample, latent_frames, temporal_subsample};
+
+    type B = NdArray;
+
+    #[test]
+    fn latent_frames_formula() {
+        assert_eq!(latent_frames(3, 2).unwrap(), 2);
+        assert_eq!(latent_frames(1, 8).unwrap(), 1);
+        assert_eq!(latent_frames(9, 8).unwrap(), 2);
+    }
+
+    #[test]
+    fn latent_frames_rejects_zero_factor() {
+        assert!(latent_frames(3, 0).is_err());
+    }
+
+    #[test]
+    fn box_downsample_averages_blocks() {
+        let device = NdArrayDevice::default();
+        // All-ones: every 2×2 average is 1.
+        let ones: Tensor<B, 5> = Tensor::ones([1, 1, 1, 4, 4], &device);
+        let down = box_downsample::<B>(ones, 2, 2, 2).unwrap();
+        let v: Vec<f32> = down.into_data().convert::<f32>().to_vec().unwrap();
+        assert!(v.iter().all(|&x| (x - 1.0_f32).abs() < 1e-5));
+
+        // Checker: cells (i//4 + i%4) even = 1.0, odd = 0.0 → 2×2 avg = 0.5.
+        let mut data = vec![0.0_f32; 16];
+        for (idx, v) in data.iter_mut().enumerate() {
+            *v = if (idx / 4 + idx % 4) % 2 == 0 {
+                1.0
+            } else {
+                0.0
+            };
+        }
+        let chkr: Tensor<B, 5> = Tensor::from_data(TensorData::new(data, [1, 1, 1, 4, 4]), &device);
+        let down2 = box_downsample::<B>(chkr, 2, 2, 2).unwrap();
+        let v2: Vec<f32> = down2.into_data().convert::<f32>().to_vec().unwrap();
+        assert!(v2.iter().all(|&x| (x - 0.5_f32).abs() < 1e-5));
+    }
+
+    #[test]
+    fn box_downsample_rejects_non_divisible() {
+        let device = NdArrayDevice::default();
+        let x: Tensor<B, 5> = Tensor::ones([1, 1, 1, 3, 4], &device);
+        assert!(box_downsample::<B>(x, 2, 2, 2).is_err());
+    }
+
+    #[test]
+    fn temporal_subsample_keeps_correct_frames() {
+        let device = NdArrayDevice::default();
+        // 4 frames [0,1,2,3]; ts=2 → keep [0, 1, 3].
+        let data: Vec<f32> = (0..4_u32).map(|i| i as f32).collect();
+        let x: Tensor<B, 5> = Tensor::from_data(TensorData::new(data, [1, 1, 4, 1, 1]), &device);
+        let sub = temporal_subsample::<B>(&x, 2).unwrap();
+        let kept: Vec<f32> = sub.into_data().convert::<f32>().to_vec().unwrap();
+        assert_eq!(kept, vec![0.0, 1.0, 3.0]);
+    }
 }

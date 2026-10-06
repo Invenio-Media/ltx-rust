@@ -6,6 +6,11 @@ use ltx_burn::{BurnBackend, GenerationSettings, ModelFiles};
 use ltx_pipeline::{PipelineConfig, run_video};
 
 // ── Backend type selection ─────────────────────────────────────────────────────
+// Exactly one backend feature may be active. Enable conflicting features together
+// and the build fails with a clear message.
+
+#[cfg(all(feature = "metal", feature = "cuda"))]
+compile_error!("features 'metal' and 'cuda' are mutually exclusive; enable at most one");
 
 /// CPU backend (default, no GPU feature selected).
 #[cfg(not(any(feature = "metal", feature = "cuda")))]
@@ -22,10 +27,10 @@ type ActiveBackend = burn::backend::Metal<half::bf16>;
 type ActiveDevice = burn::backend::metal::MetalDevice;
 
 /// NVIDIA CUDA GPU backend.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "metal")))]
 type ActiveBackend = burn::backend::Cuda<half::bf16>;
 /// Device for the CUDA backend.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "metal")))]
 type ActiveDevice = burn::backend::cuda::CudaDevice;
 // ── Argument parser ────────────────────────────────────────────────────────────
 

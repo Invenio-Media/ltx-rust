@@ -39,6 +39,10 @@ pub struct DiTFlags {
     /// The caption projection runs in the text encoder (`true`) or inside this
     /// transformer (`false`).  LTX-2.5 22B sets `true`; no `caption_projection`
     /// module is present in the checkpoint.
+    ///
+    /// The reference configurator reads `config.get("caption_proj_before_connector", True)`
+    /// (default `True`) at `model_configurator.py:133` (22B path) and `model_configurator.py:75`
+    /// (general path).  Serde default `true` matches the reference behaviour.
     #[serde(default = "bool_true")]
     pub caption_proj_before_connector: bool,
 }
@@ -288,5 +292,24 @@ mod tests {
             ..DiTConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_float64_frequencies_precision() {
+        let mut config = DiTConfig::default();
+        config.frequencies_precision = Some("float64".to_owned());
+        assert!(
+            config.validate().is_err(),
+            "float64 must be rejected to prevent silent f32/f64 RoPE divergence"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_float32_and_none_frequencies_precision() {
+        let mut config = DiTConfig::default();
+        config.frequencies_precision = None;
+        assert!(config.validate().is_ok());
+        config.frequencies_precision = Some("float32".to_owned());
+        assert!(config.validate().is_ok());
     }
 }
