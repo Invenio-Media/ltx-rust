@@ -101,12 +101,13 @@ struct Cli {
     lora: Vec<LoraSpec>,
 
     /// Prompt text. Used when --prompt-context is absent.
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", allow_hyphen_values = true)]
     prompt: String,
 
     /// Negative prompt text.
     #[arg(
         long,
+        allow_hyphen_values = true,
         default_value = "worst quality, inconsistent motion, blurry, jittery, distorted"
     )]
     negative_prompt: String,
