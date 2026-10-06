@@ -1,0 +1,21 @@
+[package]
+name = "ltx-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "End-to-end LTX alpha matte pipeline orchestration."
+
+[dependencies]
+ltx-backend = { path = "../ltx-backend" }
+ltx-chunk = { path = "../ltx-chunk" }
+ltx-io = { path = "../ltx-io" }
+ltx-shape = { path = "../ltx-shape" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
