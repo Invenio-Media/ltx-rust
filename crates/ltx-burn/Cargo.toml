@@ -1,0 +1,33 @@
+[package]
+name = "ltx-burn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure Burn backend for the LTX-2.5 Alpha Gen IC-LoRA pipeline."
+
+[features]
+default = ["burn/ndarray"]
+metal = ["burn/metal"]
+cuda = ["burn/cuda"]
+
+[dependencies]
+burn.workspace = true
+ltx-backend = { path = "../ltx-backend" }
+ltx-dit = { path = "../ltx-dit", default-features = false }
+ltx-sampler = { path = "../ltx-sampler", default-features = false }
+ltx-shape = { path = "../ltx-shape" }
+ltx-vae = { path = "../ltx-vae", default-features = false }
+ltx-vae-decoder = { path = "../ltx-vae-decoder", default-features = false }
+ltx-weights = { path = "../ltx-weights" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+burn = { workspace = true, features = ["ndarray"] }
+safetensors.workspace = true
+half.workspace = true
+
+[lints]
+workspace = true

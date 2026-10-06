@@ -39,6 +39,7 @@ pub struct DiTFlags {
     /// The caption projection runs in the text encoder (`true`) or inside this
     /// transformer (`false`).  LTX-2.5 22B sets `true`; no `caption_projection`
     /// module is present in the checkpoint.
+    #[serde(default = "bool_true")]
     pub caption_proj_before_connector: bool,
 }
 
@@ -90,6 +91,13 @@ pub struct DiTConfig {
     /// `RoPE` variant.
     #[serde(default)]
     pub rope_type: RopeType,
+    /// Frequency computation precision from the checkpoint config.
+    ///
+    /// The reference reads `config.get("frequencies_precision", False) == "float64"` to
+    /// choose `numpy` `f64` `RoPE` freq computation. The Rust `DiT` always uses `f32`. Reject
+    /// `"float64"` loudly so the user knows about the divergence.
+    #[serde(default)]
+    pub frequencies_precision: Option<String>,
     /// Feature flag set.
     #[serde(flatten)]
     pub flags: DiTFlags,
@@ -141,6 +149,7 @@ impl Default for DiTConfig {
             timestep_scale_multiplier: default_ts_scale(),
             use_middle_indices_grid: true,
             rope_type: RopeType::Split,
+            frequencies_precision: None,
             flags: DiTFlags {
                 ff_bias: false,
                 use_prompt_adaln_single: true,
@@ -225,6 +234,13 @@ impl DiTConfig {
         if self.flags.use_keyframes_abs_pos_embedding {
             return Err(DitError::Config(
                 "use_keyframes_abs_pos_embedding is not wired in this core".into(),
+            ));
+        }
+        if self.frequencies_precision.as_deref() == Some("float64") {
+            return Err(DitError::Config(
+                "frequencies_precision = \"float64\" (double-precision RoPE frequencies) is not \
+                 implemented in ltx-dit. Add f64 frequency computation in rope.rs to support it."
+                    .into(),
             ));
         }
         Ok(())
