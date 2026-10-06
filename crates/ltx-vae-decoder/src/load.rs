@@ -57,7 +57,8 @@ fn f32_values_from_le_bytes(
 ) -> Result<Vec<f32>, VaeDecoderError> {
     check_byte_len(key, shape, raw.len(), 4)?;
     let (chunks, remainder) = raw.as_chunks::<4>();
-    debug_assert!(remainder.is_empty());
+    let empty: &[u8] = &[];
+    debug_assert_eq!(remainder, empty);
     Ok(chunks
         .iter()
         .map(|bytes| f32::from_le_bytes(*bytes))
@@ -71,7 +72,8 @@ fn f16_values_from_le_bytes(
 ) -> Result<Vec<f32>, VaeDecoderError> {
     check_byte_len(key, shape, raw.len(), 2)?;
     let (chunks, remainder) = raw.as_chunks::<2>();
-    debug_assert!(remainder.is_empty());
+    let empty: &[u8] = &[];
+    debug_assert_eq!(remainder, empty);
     Ok(chunks
         .iter()
         .map(|bytes| f16::from_bits(u16::from_le_bytes(*bytes)).to_f32())
@@ -85,7 +87,8 @@ fn bf16_values_from_le_bytes(
 ) -> Result<Vec<f32>, VaeDecoderError> {
     check_byte_len(key, shape, raw.len(), 2)?;
     let (chunks, remainder) = raw.as_chunks::<2>();
-    debug_assert!(remainder.is_empty());
+    let empty: &[u8] = &[];
+    debug_assert_eq!(remainder, empty);
     Ok(chunks
         .iter()
         .map(|bytes| half::bf16::from_bits(u16::from_le_bytes(*bytes)).to_f32())

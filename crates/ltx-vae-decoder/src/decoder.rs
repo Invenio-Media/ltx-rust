@@ -37,7 +37,7 @@ use burn::{
 use safetensors::SafeTensors;
 
 use crate::{
-    config::{DecoderConfig, ModelOutputType},
+    config::{DecoderConfig, ModelOutputType, UpsampleSpec},
     error::VaeDecoderError,
     load::{load_1d, load_2d_raw, load_linear_weight},
     nn::{
@@ -51,7 +51,7 @@ use crate::{
         upsample::LinearPixelShuffleUpsample,
     },
     ops::{patchify, unpatchify},
-    tiling::{crop_trailing_context, pad_trailing_latent, stage4_thw},
+    tiling::{crop_trailing_context, pad_trailing_latent},
 };
 
 // ─── Decoder struct ──────────────────────────────────────────────────────────
@@ -119,8 +119,14 @@ pub struct DiffusionVideoDecoder<B: Backend> {
     pub natten_trailing_pad: usize,
     /// Stage-5 kernel temporal size for ghost-crop floor.
     pub stage5_kernel_t: usize,
-    /// Cumulative time-stride from the first three upsamples.
+    /// Cumulative temporal stride from the first three upsamples.
     pub time_scale: usize,
+    /// Cumulative `[T, H, W]` stride from the first three upsamples.
+    pub stage4_stride: [usize; 3],
+    /// Leading-frame temporal drop after the first three upsamples.
+    pub stage4_time_drop: usize,
+    /// Leading-frame temporal drop after all four upsamples.
+    pub pixel_time_drop: usize,
     /// Upsample-4 stride (for window reporting).
     pub up4_stride: [usize; 3],
 }
@@ -130,6 +136,18 @@ pub struct DiffusionVideoDecoder<B: Backend> {
 impl<B: Backend> DiffusionVideoDecoder<B> {
     const fn pixel_time_scale(&self) -> usize {
         self.time_scale.saturating_mul(self.up4_stride[0])
+    }
+
+    const fn pixel_time_extent(&self, latent_t: usize) -> usize {
+        latent_t
+            .saturating_mul(self.pixel_time_scale())
+            .saturating_sub(self.pixel_time_drop)
+    }
+
+    const fn stage4_time_extent(&self, latent_t: usize) -> usize {
+        latent_t
+            .saturating_mul(self.stage4_stride[0])
+            .saturating_sub(self.stage4_time_drop)
     }
 
     /// Decode a latent tensor with pre-generated noise.
@@ -152,10 +170,7 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
         let [b, _c, f_l, h_l, w_l] = latent.dims();
 
         // Pixel content extents (for final crop).
-        let pixel_f = f_l
-            .saturating_sub(1)
-            .saturating_mul(self.pixel_time_scale())
-            .saturating_add(1);
+        let pixel_f = self.pixel_time_extent(f_l);
         let pixel_h = h_l.saturating_mul(32);
         let pixel_w = w_l.saturating_mul(32);
 
@@ -380,7 +395,9 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
         latent_h: usize,
         latent_w: usize,
     ) -> Result<[usize; 3], VaeDecoderError> {
-        let [s4_t, s4_h, s4_w] = stage4_thw(&[], latent_t, latent_h, latent_w);
+        let s4_t = self.stage4_time_extent(latent_t);
+        let s4_h = latent_h.saturating_mul(self.stage4_stride[1]);
+        let s4_w = latent_w.saturating_mul(self.stage4_stride[2]);
         crate::tiling::decode_window_pixels(
             s4_t,
             s4_h,
@@ -462,8 +479,9 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
         let conv_in = build_linear(st, &p("conv_in"), config.in_channels, c0, true, device)?;
 
         // ── type_emb ──────────────────────────────────────────────────────
-        let type_emb_val = load_1d(st, &p("type_emb"), device)
-            .unwrap_or_else(|_| Tensor::zeros([config.in_channels], device));
+        let type_emb_val = load_optional_1d(st, &p("type_emb"), c0, device, || {
+            Tensor::zeros([c0], device)
+        })?;
         let type_emb = Param::from_tensor(type_emb_val);
 
         // ── deterministic stages ──────────────────────────────────────────
@@ -555,12 +573,10 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
 
         // ── config fields ─────────────────────────────────────────────────
         let up4_stride = config.upsamples.get(3).map_or([1, 1, 1], |u| u.stride);
-        let time_scale: usize = config
-            .upsamples
-            .iter()
-            .take(3)
-            .map(|u| u.stride[0])
-            .product();
+        let stage4_stride = cumulative_upsample_stride(&config.upsamples, 3);
+        let stage4_time_drop = cumulative_temporal_drop(&config.upsamples, 3);
+        let time_scale = stage4_stride[0];
+        let pixel_time_drop = cumulative_temporal_drop(&config.upsamples, 4);
         let natten_trailing_pad = config.stage_kernels.first().copied().unwrap_or([3, 3, 3])[0]
             .checked_div(2)
             .unwrap_or(0)
@@ -594,12 +610,42 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
             natten_trailing_pad,
             stage5_kernel_t: stage5_kernel[0],
             time_scale,
+            stage4_stride,
+            stage4_time_drop,
+            pixel_time_drop,
             up4_stride,
         })
     }
 }
 
 // ─── Weight-loading helpers ───────────────────────────────────────────────────
+
+fn cumulative_upsample_stride(upsamples: &[UpsampleSpec], count: usize) -> [usize; 3] {
+    upsamples
+        .iter()
+        .take(count)
+        .fold([1_usize, 1_usize, 1_usize], |stride, upsample| {
+            [
+                stride[0].saturating_mul(upsample.stride[0]),
+                stride[1].saturating_mul(upsample.stride[1]),
+                stride[2].saturating_mul(upsample.stride[2]),
+            ]
+        })
+}
+
+fn cumulative_temporal_drop(upsamples: &[UpsampleSpec], count: usize) -> usize {
+    upsamples
+        .iter()
+        .take(count)
+        .fold(0_usize, |drop, upsample| {
+            let scaled_drop = drop.saturating_mul(upsample.stride[0]);
+            if upsample.stride[0] == 2 {
+                scaled_drop.saturating_add(1)
+            } else {
+                scaled_drop
+            }
+        })
+}
 
 fn load_optional_1d<B: Backend>(
     st: &SafeTensors<'_>,
@@ -860,4 +906,69 @@ fn load_diff_block<B: Backend>(
         mlp,
         context_channels,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reference_upsamples() -> [UpsampleSpec; 4] {
+        [
+            UpsampleSpec {
+                stride: [1, 2, 2],
+                out_channels_reduction_factor: 2,
+            },
+            UpsampleSpec {
+                stride: [2, 1, 1],
+                out_channels_reduction_factor: 2,
+            },
+            UpsampleSpec {
+                stride: [2, 2, 2],
+                out_channels_reduction_factor: 1,
+            },
+            UpsampleSpec {
+                stride: [2, 2, 2],
+                out_channels_reduction_factor: 2,
+            },
+        ]
+    }
+
+    #[test]
+    fn cumulative_upsample_plan_matches_reference_window() {
+        let upsamples = reference_upsamples();
+        let stage4_stride = cumulative_upsample_stride(&upsamples, 3);
+        let stage4_time_drop = cumulative_temporal_drop(&upsamples, 3);
+        let pixel_time_drop = cumulative_temporal_drop(&upsamples, 4);
+
+        assert_eq!(stage4_stride, [4, 4, 4]);
+        assert_eq!(stage4_time_drop, 3);
+        assert_eq!(pixel_time_drop, 7);
+
+        let latent_t = 2_usize;
+        let latent_h = 3_usize;
+        let latent_w = 4_usize;
+        let stage4_t = latent_t
+            .saturating_mul(stage4_stride[0])
+            .saturating_sub(stage4_time_drop);
+        let stage4_h = latent_h.saturating_mul(stage4_stride[1]);
+        let stage4_w = latent_w.saturating_mul(stage4_stride[2]);
+
+        let window = crate::tiling::decode_window_pixels(
+            stage4_t,
+            stage4_h,
+            stage4_w,
+            upsamples[3].stride,
+            4,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(window, [9, 96, 128]);
+        assert_eq!(
+            latent_t
+                .saturating_mul(stage4_stride[0].saturating_mul(upsamples[3].stride[0]))
+                .saturating_sub(pixel_time_drop),
+            9
+        );
+    }
 }
