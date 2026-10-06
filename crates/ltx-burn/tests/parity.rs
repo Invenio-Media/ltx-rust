@@ -83,9 +83,11 @@ fn chw_to_interleaved_01(data: &[f32], c: usize, f: usize, h: usize, w: usize) -
     }
     out
 }
-
-#[test]
-fn parity_end_to_end() {
+/// Load models and build a [`BurnBackend`] from the parity fixture.
+///
+/// Returns `(backend, store, device)` so callers can access extra tensors
+/// stored in the fixture (noise, expected alpha, etc.).
+fn load_fixture_backend() -> (BurnBackend<B>, WeightStore, NdArrayDevice) {
     let path = fixture_path();
     assert!(
         path.exists(),
@@ -96,7 +98,6 @@ fn parity_end_to_end() {
     let device = NdArrayDevice::default();
     let store = WeightStore::open(&[&path], &KeyMap::identity()).unwrap();
 
-    // ── Parse configs from metadata ───────────────────────────────────────────
     let enc_cfg_str = store.metadata("encoder_config").expect("encoder_config");
     let enc_cfg_json: serde_json::Value = serde_json::from_str(enc_cfg_str).unwrap();
     let enc_cfg = VaeEncoderConfig::from_vae_json(&enc_cfg_json).unwrap();
@@ -143,7 +144,6 @@ fn parity_end_to_end() {
         .parse()
         .unwrap();
 
-    // ── Load model components from fixture ────────────────────────────────────
     let encoder = VideoEncoder::<B>::load(&store.scope("enc"), &enc_cfg, &device).unwrap();
     let decoder = DiffusionVideoDecoder::<B>::load(&store.scope("dec"), &dec_cfg, &device).unwrap();
     let transformer =
@@ -157,7 +157,6 @@ fn parity_end_to_end() {
         .optional("negative.video_encoding", &device)
         .unwrap();
 
-    // ── Build BurnBackend ─────────────────────────────────────────────────────
     let ic_layout = IcLoraLayout::new(ds, ts).unwrap();
     let settings = GenerationSettings {
         num_inference_steps: num_steps,
@@ -172,8 +171,20 @@ fn parity_end_to_end() {
         negative_context,
         ic_layout,
         settings,
-        device,
+        device.clone(),
     );
+    (backend, store, device)
+}
+
+#[test]
+fn parity_end_to_end() {
+    let (backend, store, device) = load_fixture_backend();
+
+    let kf_strength: f32 = store
+        .metadata("kf_strength")
+        .unwrap_or("0.95")
+        .parse()
+        .unwrap();
 
     // ── Load test inputs ──────────────────────────────────────────────────────
     let rgb_raw: Vec<f32> = store
@@ -260,56 +271,10 @@ fn probe_returns_unsupported() {
     use ltx_backend::{AlphaBackend, BackendError};
     use ltx_shape::PixelShape;
 
-    let path = fixture_path();
-    if !path.exists() {
-        return; // skip if fixture not built
-    }
-
-    let device = NdArrayDevice::default();
-    let store = WeightStore::open(&[&path], &KeyMap::identity()).unwrap();
-
-    let enc_cfg: serde_json::Value =
-        serde_json::from_str(store.metadata("encoder_config").unwrap()).unwrap();
-    let dec_cfg: serde_json::Value =
-        serde_json::from_str(store.metadata("decoder_config").unwrap()).unwrap();
-    let tfm_cfg_raw: serde_json::Value =
-        serde_json::from_str(store.metadata("transformer_config").unwrap()).unwrap();
-    let enc = VideoEncoder::<B>::load(
-        &store.scope("enc"),
-        &ltx_vae::VaeEncoderConfig::from_vae_json(&enc_cfg).unwrap(),
-        &device,
-    )
-    .unwrap();
-    let dec = DiffusionVideoDecoder::<B>::load(
-        &store.scope("dec"),
-        &DecoderConfig::from_vae_json(&dec_cfg).unwrap(),
-        &device,
-    )
-    .unwrap();
-    let tfm = VideoTransformer::<B>::load(
-        &store.scope("tfm"),
-        &ltx_dit::DiTConfig::from_json(tfm_cfg_raw.get("transformer").unwrap_or(&tfm_cfg_raw))
-            .unwrap(),
-        &device,
-    )
-    .unwrap();
-    let ctx: Tensor<B, 3> = store
-        .scope("ctx")
-        .tensor("positive.video_encoding", &device)
-        .unwrap();
-    let backend = BurnBackend::from_components(
-        tfm,
-        enc,
-        dec,
-        ctx,
-        None,
-        IcLoraLayout::new(1, 2).unwrap(),
-        GenerationSettings::default(),
-        device,
-    );
+    let (backend, _, _) = load_fixture_backend();
     let shape = PixelShape::new(9, 32, 32, ltx_shape::ScaleFactors::LTX2).unwrap();
     assert!(
         matches!(backend.probe(shape), Err(BackendError::Unsupported(_))),
-        "probe() must return Unsupported"
+        "probe() must return Err(Unsupported)"
     );
 }

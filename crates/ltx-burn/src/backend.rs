@@ -647,13 +647,18 @@ fn interleaved_to_channels_first<B: Backend>(
 /// with aspect-ratio-preserving scale and center crop, exactly matching
 /// `resize_and_center_crop` in `ltx_pipelines.utils.media_io.resize`.
 ///
+/// Antialiasing: the Python reference calls `F.interpolate` without the `antialias`
+/// keyword (PyTorch 2.14.1, `ltx_pipelines/utils/media_io/resize.py`), which
+/// defaults to `antialias=False` for bilinear mode. This Rust implementation
+/// matches that: no antialiasing, pure bilinear with `align_corners=False`.
+///
 /// All computation is done in `f64` host-side to match PyTorch's internal precision.
 /// The `ceil` step uses exact integer `div_ceil` to avoid floating-point off-by-one
 /// errors that occur when `src * scale` is within machine epsilon of an integer.
 ///
-/// # Panics / Errors
-/// Returns `Err` when `batch != 1`, when tensor data cannot be read, or when the
-/// internal geometry is inconsistent (should not happen given the validation above).
+/// # Errors
+/// Returns `Err` when `batch != 1`, any dimension is zero, tensor data cannot be
+/// read, or the internal geometry is inconsistent.
 #[expect(
     clippy::doc_markdown,
     reason = "PyTorch is a proper noun; False is Python bool literal, not a Rust item"
@@ -987,9 +992,9 @@ mod tests {
             "non-square crop failed: {got:?}"
         );
     }
+
     #[test]
     fn bilinear_resize_fractional_scale_with_crop() {
-        use burn::backend::ndarray::NdArrayDevice;
         let device = NdArrayDevice::default();
         // Source 3×5 → target 2×2.
         // h-dominant: scale = 2/3; new_h=2, new_w=ceil(5*2/3)=ceil(10/3)=4; crop_left=1.
