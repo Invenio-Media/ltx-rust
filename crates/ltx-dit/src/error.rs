@@ -7,23 +7,11 @@ pub enum DitError {
     #[error("config error: {0}")]
     Config(String),
 
-    /// A weight key is missing from the weight store.
-    #[error("missing weight key: {key}")]
-    MissingKey { key: String },
-
-    /// Shape mismatch when loading a weight tensor.
-    #[error("shape mismatch for {key}: expected {expected:?}, got {actual:?}")]
-    ShapeMismatch {
-        key: String,
-        expected: Vec<usize>,
-        actual: Vec<usize>,
-    },
-
-    /// A safetensors I/O error.
-    #[error("safetensors: {0}")]
-    Safetensors(#[from] safetensors::SafeTensorError),
-
-    /// A JSON decode error.
+    /// A JSON decode error (from [`DiTConfig::from_json`]).
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// A weight-loading error from `ltx-weights`.
+    #[error("weight error: {0}")]
+    Weight(#[from] ltx_weights::WeightError),
 }

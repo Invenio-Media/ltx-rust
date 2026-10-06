@@ -16,8 +16,8 @@ use burn::prelude::*;
 use burn::tensor::DType;
 use burn::tensor::activation::silu;
 
-// Half-dim for the sinusoidal embedding (256 channels total).
-const SINUSOIDAL_HALF: usize = 128;
+/// Half-dimension of the sinusoidal timestep embedding (total = 2×).
+pub(crate) const SINUSOIDAL_HALF: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Sinusoidal timestep embedding (no learnable parameters)
@@ -37,8 +37,8 @@ const SINUSOIDAL_HALF: usize = 128;
 #[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
-    reason = "loop indices i in 0..128 and constant SINUSOIDAL_HALF=128 are ≤ 128; \
-              lossless f32 conversion and no overflow risk"
+    clippy::arithmetic_side_effects,
+    reason = "loop indices i in 0..128 are ≤ 128 (lossless f32); Burn tensor ops run on the compute backend"
 )]
 pub fn sinusoidal_emb<B: Backend>(timesteps: Tensor<B, 1>, device: &B::Device) -> Tensor<B, 2> {
     let n = timesteps.dims()[0];
@@ -125,7 +125,7 @@ impl<B: Backend> AdaLayerNormSingle<B> {
     /// Embed `timesteps` (flat `(N,)`) and project.
     ///
     /// Returns `(modulation, embedded_timestep)`:
-    /// - `modulation`: `(N, coeff × inner_dim)` — per-block AdaLN weights.
+    /// - `modulation`: `(N, coeff × inner_dim)` — per-block `AdaLN` weights.
     /// - `embedded_timestep`: `(N, inner_dim)` — used by the output norm.
     pub fn forward(
         &self,

@@ -1,8 +1,8 @@
-//! Multi-head attention for the LTX-2.5 video DiT.
+//! Multi-head attention for the LTX-2.5 video `DiT`.
 //!
 //! # Features
 //! - Q/K RMS-norms (learnable `gamma`, matching `torch.nn.RMSNorm` in the reference).
-//! - Optional 3-D RoPE applied after Q/K norm.
+//! - Optional 3-D `RoPE` applied after Q/K norm.
 //! - Optional per-head sigmoid gating (`apply_gated_attention`).
 //! - Additive attention-bias mask (float log-space, shape `(B, 1, T_q, T_k)`).
 //! - Self-attention when no explicit context is given.
@@ -12,7 +12,7 @@
 //! [`burn::nn::MultiHeadAttention`] computes `query.matmul(key.transpose())`
 //! explicitly, materialising a full `(B, H, T, T)` score matrix on every
 //! backend including `ndarray` (CPU) and `wgpu`.  It also does not support
-//! QK-norm or RoPE, so we implement attention from scratch here.
+//! QK-norm or `RoPE`, so we implement attention from scratch here.
 //!
 //! The same materialisation happens in our own [`sdp_attention`]: the full
 //! `(B, H, T_q, T_k)` score matrix is computed on all backends.
@@ -32,7 +32,7 @@ use burn::tensor::activation::{sigmoid, softmax};
 use crate::config::RopeType;
 use crate::rope::{apply_interleaved_rope, apply_split_rope};
 
-/// Multi-head attention with QK-norm, optional RoPE, optional gating, and an
+/// Multi-head attention with QK-norm, optional `RoPE`, optional gating, and an
 /// optional chunked query-block path.
 #[derive(Module, Debug)]
 pub struct Attention<B: Backend> {
@@ -56,7 +56,7 @@ pub struct Attention<B: Backend> {
     pub d_head: usize,
     /// Pre-computed `1 / sqrt(d_head)` attention scale.
     pub attn_scale: f32,
-    /// RoPE variant.
+    /// `RoPE` variant.
     pub rope_type: RopeType,
     /// Optional chunk size along Q's sequence dimension.
     /// `None` uses full O(T²) attention; `Some(c)` processes Q in chunks of c.
@@ -128,8 +128,12 @@ impl<B: Backend> Attention<B> {
     /// - `context`: key/value tokens `(B, T_k, context_dim)` (`None` = self-attention).
     /// - `mask`: optional additive attention bias `(B, 1, T_q, T_k)` in log-space.
     ///   Log-space means `0.0` = full attention, very negative = masked out.
-    /// - `pe`: optional RoPE `(cos, sin)` for Q and K.
-    /// - `k_pe`: optional separate RoPE for K; if absent, `pe` is reused.
+    /// - `pe`: optional `RoPE` `(cos, sin)` for Q and K.
+    /// - `k_pe`: optional separate `RoPE` for K; if absent, `pe` is reused.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "Burn tensor operators run on the compute backend; no integer overflow possible"
+    )]
     pub fn forward(
         &self,
         x: Tensor<B, 3>,
@@ -217,6 +221,10 @@ fn apply_rope<B: Backend>(
 /// All backends (`ndarray`, wgpu, cuda) materialise the full `(B, H, T_q, T_k)`
 /// matrix here.  Use [`chunked_sdp_attention`] to bound peak memory
 /// linearly in `chunk_size`.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "Burn tensor operators run on the compute backend; no integer overflow possible"
+)]
 fn sdp_attention<B: Backend>(
     q: Tensor<B, 4>,
     k: Tensor<B, 4>,

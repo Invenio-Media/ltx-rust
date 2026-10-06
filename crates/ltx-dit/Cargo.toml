@@ -15,7 +15,7 @@ cuda = ["burn/cuda"]
 
 [dependencies]
 burn = { workspace = true, features = ["std"] }
-safetensors.workspace = true
+ltx-weights = { path = "../ltx-weights" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
