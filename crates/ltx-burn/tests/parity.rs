@@ -254,3 +254,62 @@ fn parity_end_to_end() {
         alpha_chunk.data.len()
     );
 }
+
+#[test]
+fn probe_returns_unsupported() {
+    use ltx_backend::{AlphaBackend, BackendError};
+    use ltx_shape::PixelShape;
+
+    let path = fixture_path();
+    if !path.exists() {
+        return; // skip if fixture not built
+    }
+
+    let device = NdArrayDevice::default();
+    let store = WeightStore::open(&[&path], &KeyMap::identity()).unwrap();
+
+    let enc_cfg: serde_json::Value =
+        serde_json::from_str(store.metadata("encoder_config").unwrap()).unwrap();
+    let dec_cfg: serde_json::Value =
+        serde_json::from_str(store.metadata("decoder_config").unwrap()).unwrap();
+    let tfm_cfg_raw: serde_json::Value =
+        serde_json::from_str(store.metadata("transformer_config").unwrap()).unwrap();
+    let enc = VideoEncoder::<B>::load(
+        &store.scope("enc"),
+        &ltx_vae::VaeEncoderConfig::from_vae_json(&enc_cfg).unwrap(),
+        &device,
+    )
+    .unwrap();
+    let dec = DiffusionVideoDecoder::<B>::load(
+        &store.scope("dec"),
+        &DecoderConfig::from_vae_json(&dec_cfg).unwrap(),
+        &device,
+    )
+    .unwrap();
+    let tfm = VideoTransformer::<B>::load(
+        &store.scope("tfm"),
+        &ltx_dit::DiTConfig::from_json(tfm_cfg_raw.get("transformer").unwrap_or(&tfm_cfg_raw))
+            .unwrap(),
+        &device,
+    )
+    .unwrap();
+    let ctx: Tensor<B, 3> = store
+        .scope("ctx")
+        .tensor("positive.video_encoding", &device)
+        .unwrap();
+    let backend = BurnBackend::from_components(
+        tfm,
+        enc,
+        dec,
+        ctx,
+        None,
+        IcLoraLayout::new(1, 2).unwrap(),
+        GenerationSettings::default(),
+        device,
+    );
+    let shape = PixelShape::new(9, 32, 32, ltx_shape::ScaleFactors::LTX2).unwrap();
+    assert!(
+        matches!(backend.probe(shape), Err(BackendError::Unsupported(_))),
+        "probe() must return Unsupported"
+    );
+}

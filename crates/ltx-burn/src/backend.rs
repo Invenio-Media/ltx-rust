@@ -390,6 +390,9 @@ impl<B: Backend> BurnBackend<B> {
         let ts = usize::try_from(self.ic_layout.reference_temporal())
             .map_err(|_| BurnError::Overflow)?;
 
+        // Floor division matches the Python reference (`//` operator).
+        // If ds does not divide height/width exactly, the remainder is silently
+        // dropped (the encoder crops trailing partial-patch rows/columns anyway).
         let ref_h = height.checked_div(ds).ok_or(BurnError::Overflow)?;
         let ref_w = width.checked_div(ds).ok_or(BurnError::Overflow)?;
 
@@ -680,6 +683,11 @@ fn resize_and_center_crop_5d<B: Backend>(
     if nb != 1 {
         return Err(BurnError::InvalidInput(format!(
             "batch must be 1, got {nb}"
+        )));
+    }
+    if src_h == 0 || src_w == 0 || dst_h == 0 || dst_w == 0 {
+        return Err(BurnError::InvalidInput(format!(
+            "resize dimensions must be non-zero: src={src_h}×{src_w} dst={dst_h}×{dst_w}"
         )));
     }
 
@@ -978,5 +986,26 @@ mod tests {
             vec![2.0, 3.0, 4.0, 5.0],
             "non-square crop failed: {got:?}"
         );
+    }
+    #[test]
+    fn bilinear_resize_fractional_scale_with_crop() {
+        use burn::backend::ndarray::NdArrayDevice;
+        let device = NdArrayDevice::default();
+        // Source 3×5 → target 2×2.
+        // h-dominant: scale = 2/3; new_h=2, new_w=ceil(5*2/3)=ceil(10/3)=4; crop_left=1.
+        // Expected values computed from Python reference
+        // (F.interpolate + center crop, both torch and resize_and_center_crop match):
+        //   [[2.625, 3.875], [10.125, 11.375]]
+        let data: Vec<f32> = (0..15_u32).map(|i| i as f32).collect();
+        let x: Tensor<B, 5> = Tensor::from_data(TensorData::new(data, [1, 1, 1, 3, 5]), &device);
+        let out = resize_and_center_crop_5d::<B>(x, 2, 2, &device).unwrap();
+        let got: Vec<f32> = out.into_data().convert::<f32>().to_vec().unwrap();
+        let expected = vec![2.625_f32, 3.875, 10.125, 11.375];
+        for (g, e) in got.iter().zip(expected.iter()) {
+            assert!(
+                (g - e).abs() < 1e-4,
+                "fractional-scale bilinear mismatch: got {got:?} expected {expected:?}"
+            );
+        }
     }
 }
