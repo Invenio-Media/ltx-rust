@@ -283,8 +283,14 @@ def make_dit_parity_fixture_gated_adaln() -> None:
 
     ``BasicAVTransformerBlock`` initialises ``scale_shift_table`` and
     ``prompt_scale_shift_table`` with ``torch.empty`` (uninitialized memory).
-    After the model is built all parameters are reset to ``N(0, 0.02)`` (seeded)
-    to prevent NaN from memory garbage reaching the gated/cross-AdaLN paths.
+    After the model is built, parameters are re-seeded:
+
+    * Linear weights, RmsNorm gammas, and gate-logits weights: ``N(0, 0.02)``
+      (small, keeps activations in a reasonable range).
+    * ``scale_shift_table`` and ``prompt_scale_shift_table``: ``N(0, 0.5)``
+      (larger, so the AdaLN shift/scale/gate terms dominate and any wrong
+      index ordering — swapped shift/scale, wrong ``[6:9]`` slice, etc. —
+      produces a clearly visible numeric difference in the parity test).
     """
     torch.manual_seed(99)
     model = LTXModel(
@@ -309,14 +315,17 @@ def make_dit_parity_fixture_gated_adaln() -> None:
         attention_ops=_cpu_ops(),
     ).eval()
 
-    # Re-seed and reset ALL parameters: torch.empty-based params
-    # (scale_shift_table, prompt_scale_shift_table) contain uninitialized
-    # memory that can produce NaN through the gated / cross-AdaLN paths.
-    # Small std keeps outputs numerically stable.
+    # Re-seed and reset all parameters to prevent NaN from torch.empty.
+    # scale_shift_table / prompt_scale_shift_table use larger std so wrong
+    # coefficient ordering (shift vs scale, wrong [6:9] slice) produces
+    # a clearly visible parity failure.
     torch.manual_seed(99)
     with torch.no_grad():
-        for param in model.parameters():
-            torch.nn.init.normal_(param, std=0.02)
+        for name, param in model.named_parameters():
+            if "scale_shift_table" in name:
+                torch.nn.init.normal_(param, std=0.5)
+            else:
+                torch.nn.init.normal_(param, std=0.02)
 
     latent, timesteps, sigma, positions, context = _build_inputs(seed=99)
     output_v = _run_model(model, latent, timesteps, sigma, positions, context)

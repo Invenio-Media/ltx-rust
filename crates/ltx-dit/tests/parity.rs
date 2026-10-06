@@ -107,13 +107,15 @@ fn parity_video_transformer() {
     let got: Vec<f32> = output.into_data().to_vec().unwrap();
     assert_tensors_close(&got, &expected_host.data, "output");
 }
+
 /// Parity test: `apply_gated_attention=True`, `cross_attention_adaln=True`,
 /// `use_prompt_adaln_single=False`, `ff_bias=True` (non-default flags, seed 99).
 ///
 /// Exercises the gated-attention and cross-attention `AdaLN` forward paths that
-/// the 22B checkpoint may enable via metadata keys.  All model parameters were
-/// reset to `N(0, 0.02)` in the fixture to prevent NaN from `torch.empty`-
-/// initialised `scale_shift_table` / `prompt_scale_shift_table` parameters.
+/// the 22B checkpoint may enable via metadata keys.  `scale_shift_table` and
+/// `prompt_scale_shift_table` use `N(0, 0.5)` so any wrong coefficient ordering
+/// (swapped shift/scale, wrong `[6:9]` slice) produces a clearly visible parity
+/// failure; other parameters use `N(0, 0.02)`.
 #[test]
 fn parity_video_transformer_gated_adaln() {
     let path = fixture("dit_parity_gated_adaln.safetensors");
@@ -274,5 +276,18 @@ fn load_cross_attn_adaln_missing_key_returns_error() {
     assert!(
         matches!(result, Err(ltx_dit::DitError::Weight(_))),
         "expected weight error for missing prompt_scale_shift_table, got {result:?}"
+    );
+}
+/// `DiTConfig::validate` must reject `cross_attention_adaln=True` +
+/// `use_prompt_adaln_single=True`: the prompt `AdaLN` MLP that computes
+/// per-timestep K/V modulation is NOT wired in the Rust port.
+#[test]
+fn config_rejects_cross_attn_adaln_with_prompt_adaln_single() {
+    let mut config = fixture_config();
+    config.flags.cross_attention_adaln = true;
+    config.flags.use_prompt_adaln_single = true; // invalid combination
+    assert!(
+        config.validate().is_err(),
+        "validate() should reject cross_attention_adaln+use_prompt_adaln_single"
     );
 }
