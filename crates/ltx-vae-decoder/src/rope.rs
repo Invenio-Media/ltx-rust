@@ -112,8 +112,7 @@ pub fn rot_abs_axis<B: Backend>(
     // re, ro: [d0,d1,d2,d3,d4,d_half] → each → [n, d_half, 1] → cat → [n, d_half, 2]
     let re_3: Tensor<B, 3> = re.reshape([n, d_half, 1]);
     let ro_3: Tensor<B, 3> = ro.reshape([n, d_half, 1]);
-    Tensor::cat(vec![re_3, ro_3], 2)
-        .reshape([d0, d1, d2, d3, d4, head_size])
+    Tensor::cat(vec![re_3, ro_3], 2).reshape([d0, d1, d2, d3, d4, head_size])
 }
 
 /// Apply full-volume absolute `RoPE` to a `[B, T, H, W, NH, HD]` tensor.

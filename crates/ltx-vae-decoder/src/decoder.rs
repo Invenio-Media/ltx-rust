@@ -623,7 +623,11 @@ fn scope_swiglu<B: Backend>(
     let w_up = scope_linear(&scope.scope("w_up"), device)?;
     let w_gate = scope_linear(&scope.scope("w_gate"), device)?;
     let w_down = scope_linear(&scope.scope("w_down"), device)?;
-    Ok(SwiGlu { w_up, w_gate, w_down })
+    Ok(SwiGlu {
+        w_up,
+        w_gate,
+        w_down,
+    })
 }
 
 /// Load `NeighborhoodAttention3D` from `scope.{qkv.to_{q,k,v},proj,q_norm,k_norm}`.
@@ -676,7 +680,14 @@ fn scope_na_block<B: Backend>(
     device: &B::Device,
 ) -> Result<NaBlock<B>, VaeDecoderError> {
     let norm1 = scope_rms_norm(&scope.scope("norm1"), device)?;
-    let attn = scope_na_attn(&scope.scope("attn"), dim, kernel, head_dim, rope_split, device)?;
+    let attn = scope_na_attn(
+        &scope.scope("attn"),
+        dim,
+        kernel,
+        head_dim,
+        rope_split,
+        device,
+    )?;
     let norm2 = scope_rms_norm(&scope.scope("norm2"), device)?;
     let mlp = scope_swiglu(&scope.scope("mlp"), device)?;
     Ok(NaBlock {
@@ -733,10 +744,7 @@ fn scope_upsample<B: Backend>(
     let c_out = c_in
         .checked_div(up_spec.out_channels_reduction_factor.max(1))
         .unwrap_or(c_in);
-    let proj = scope_linear(
-        &scope.scope(&format!("upsamples.{idx}.proj")),
-        device,
-    )?;
+    let proj = scope_linear(&scope.scope(&format!("upsamples.{idx}.proj")), device)?;
     Ok(LinearPixelShuffleUpsample {
         proj,
         stride: up_spec.stride,
@@ -760,7 +768,14 @@ fn scope_diff_block<B: Backend>(
     let sst: Tensor<B, 2> = scope.tensor("scale_shift_table", device)?;
     let scale_shift_table = Param::from_tensor(sst);
     let norm1 = scope_rms_norm(&scope.scope("norm1"), device)?;
-    let attn = scope_na_attn(&scope.scope("attn"), dim, kernel, head_dim, rope_split, device)?;
+    let attn = scope_na_attn(
+        &scope.scope("attn"),
+        dim,
+        kernel,
+        head_dim,
+        rope_split,
+        device,
+    )?;
     let norm2 = scope_rms_norm(&scope.scope("norm2"), device)?;
     let mlp = scope_swiglu(&scope.scope("mlp"), device)?;
     Ok(CombinedDiffusionNaBlock {

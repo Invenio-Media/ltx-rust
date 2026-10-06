@@ -54,8 +54,12 @@ fn parity_full_decode() {
         .expect("decoder must load without error");
 
     // ── Load inputs ────────────────────────────────────────────────────────
-    let latent_host = store.read("input_latent").expect("fixture must have input_latent");
-    let noise_host = store.read("input_noise").expect("fixture must have input_noise");
+    let latent_host = store
+        .read("input_latent")
+        .expect("fixture must have input_latent");
+    let noise_host = store
+        .read("input_noise")
+        .expect("fixture must have input_noise");
     let expected_host = store
         .read("output_pixels")
         .expect("fixture must have output_pixels");
@@ -83,11 +87,9 @@ fn parity_full_decode() {
     let expected_data = expected.into_data().convert::<f32>();
 
     assert_eq!(
-        pixels_data.shape,
-        expected_data.shape,
+        pixels_data.shape, expected_data.shape,
         "output shape mismatch: Rust={:?}  Python={:?}",
-        pixels_data.shape,
-        expected_data.shape,
+        pixels_data.shape, expected_data.shape,
     );
 
     let got_vals = pixels_data
@@ -117,13 +119,10 @@ fn parity_full_decode() {
         }
     }
 
-    println!(
-        "parity_full_decode: max_abs_err={max_abs_err:.2e}  failures={fail_count}/{total}"
-    );
+    println!("parity_full_decode: max_abs_err={max_abs_err:.2e}  failures={fail_count}/{total}");
 
     assert_eq!(
-        fail_count,
-        0,
+        fail_count, 0,
         "parity_full_decode: {fail_count}/{total} elements exceeded tolerance \
          (atol={atol}, rtol={rtol}); max abs err = {max_abs_err:.2e}"
     );
