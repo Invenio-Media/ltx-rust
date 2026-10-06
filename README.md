@@ -24,6 +24,21 @@ alpha matte.
 | `ltx-dit` | LTX video transformer modules |
 | `ltx-vae-decoder` | Diffusion-video VAE decoder modules |
 | `ltx-pipeline` | End-to-end chunk orchestration from video input to EXR matte output |
+| `ltx-cli` | `ltx` command: runs the pipeline through the Python reference backend |
+
+## Usage
+
+```sh
+cargo run --release -p ltx-cli -- input.mp4 out_mattes \
+  --python /path/to/LTX-2/.venv/bin/python \
+  --transformer ltx-2.5-transformer.safetensors \
+  --video-vae ltx-2.5-video-vae.safetensors \
+  --lora alpha-gen-ic-lora.safetensors:1.0 \
+  --prompt-context prompt_context.safetensors
+```
+
+`--chunk-len` (8k+1) and `--overlap` (multiple of 8) set the temporal chunking.
+Run `ltx --help` for all options.
 
 ## Checks
 
