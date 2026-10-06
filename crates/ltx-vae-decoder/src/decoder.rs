@@ -418,6 +418,10 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
     ///
     /// Returns a [`VaeDecoderError`] if the config is invalid or any required
     /// weight key is missing.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "each weight key listed explicitly so names are auditable against the Python state dict"
+    )]
     pub fn load(
         scope: &ltx_weights::Scope<'_>,
         config: &DecoderConfig,
