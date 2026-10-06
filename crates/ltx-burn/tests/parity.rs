@@ -83,6 +83,7 @@ fn chw_to_interleaved_01(data: &[f32], c: usize, f: usize, h: usize, w: usize) -
     }
     out
 }
+
 /// Load models and build a [`BurnBackend`] from the parity fixture.
 ///
 /// Returns `(backend, store, device)` so callers can access extra tensors
