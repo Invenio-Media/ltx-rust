@@ -535,6 +535,57 @@ fn lora_merge_with_alpha() {
 }
 
 #[test]
+fn lora_merges_stack_on_the_same_key() {
+    // Two LoRAs on one 2x2 weight must add: W + 1.0*(B1@A1) + 0.5*(B2@A2).
+    let base_bytes = f32_bytes(&[1.0f32, 0.0, 0.0, 1.0]);
+    let sft = make_safetensors(None, &[("w.weight", &[2, 2], "F32", &base_bytes)]);
+    let (_tmp, path) = write_tmp(&sft);
+
+    // B1@A1 = [[3,6],[4,8]]
+    let first = make_safetensors(
+        None,
+        &[
+            ("w.lora_A.weight", &[1, 2], "F32", &f32_bytes(&[1.0, 2.0])),
+            ("w.lora_B.weight", &[2, 1], "F32", &f32_bytes(&[3.0, 4.0])),
+        ],
+    );
+    // B2@A2 = [[2,0],[0,-2]] (rank 2), scaled by strength 0.5 -> [[1,0],[0,-1]]
+    let second = make_safetensors(
+        None,
+        &[
+            (
+                "w.lora_A.weight",
+                &[2, 2],
+                "F32",
+                &f32_bytes(&[1.0, 0.0, 0.0, 1.0]),
+            ),
+            (
+                "w.lora_B.weight",
+                &[2, 2],
+                "F32",
+                &f32_bytes(&[2.0, 0.0, 0.0, -2.0]),
+            ),
+        ],
+    );
+    let (_first_tmp, first_path) = write_tmp(&first);
+    let (_second_tmp, second_path) = write_tmp(&second);
+
+    let mut store = WeightStore::open(&[&path], &KeyMap::identity()).unwrap();
+    store
+        .merge_lora(&LoraFile::open(&first_path).unwrap(), 1.0)
+        .unwrap();
+    store
+        .merge_lora(&LoraFile::open(&second_path).unwrap(), 0.5)
+        .unwrap();
+
+    let ht = store.read("w.weight").unwrap();
+    let expected = [1.0 + 3.0 + 1.0, 6.0, 4.0, 1.0 + 8.0 - 1.0];
+    for (got, want) in ht.data.iter().zip(expected) {
+        assert!((got - want).abs() < 1e-5, "{:?} != {expected:?}", ht.data);
+    }
+}
+
+#[test]
 fn lora_unmatched_keys_reported() {
     let base_bytes = f32_bytes(&[1.0f32]);
     let sft = make_safetensors(None, &[("present.weight", &[1], "F32", &base_bytes)]);

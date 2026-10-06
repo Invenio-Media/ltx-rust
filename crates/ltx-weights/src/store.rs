@@ -102,8 +102,9 @@ pub struct WeightStore {
     scale_keys: HashSet<String>,
     /// `__metadata__` merged across all files.
     metadata: HashMap<String, String>,
-    /// Cached `LoRA` deltas: key → f32 delta (same element count as weight).
-    lora_deltas: HashMap<String, Vec<f32>>,
+    /// Merged `LoRA` updates per base key, kept as low-rank factors and
+    /// expanded only when that key is read.
+    lora_deltas: HashMap<String, Vec<LowRankDelta>>,
 }
 
 impl WeightStore {
@@ -469,7 +470,8 @@ impl WeightStore {
     ///
     /// All dtypes (F32, F16, BF16, FP8) are dequantized.  If a sibling
     /// `{key}_scale` entry exists, the scale is applied before returning.
-    /// Any merged `LoRA` delta is added.
+    /// Any merged `LoRA` update is added; it is expanded from its low-rank
+    /// factors on every call (`O(out · in · rank)` per merged `LoRA`).
     ///
     /// # Errors
     ///
@@ -505,13 +507,10 @@ impl WeightStore {
             }
         }
 
-        // Apply cached LoRA delta.
-        if let Some(delta) = self.lora_deltas.get(key) {
-            if delta.len() != f32_data.len() {
-                return Err(WeightError::LoraShapeMismatch(key.to_owned()));
-            }
-            for (v, d) in f32_data.iter_mut().zip(delta.iter()) {
-                *v += *d;
+        // Add merged LoRA updates: W += scale * (B @ A), one key at a time.
+        if let Some(deltas) = self.lora_deltas.get(key) {
+            for delta in deltas {
+                delta.add_to(&mut f32_data, key)?;
             }
         }
 
@@ -560,7 +559,7 @@ impl WeightStore {
             })
             .collect();
 
-        let mut pending_deltas: Vec<(String, Vec<f32>)> = Vec::new();
+        let mut pending_deltas: Vec<(String, LowRankDelta)> = Vec::new();
 
         for (base_key, key_a, key_b) in lora_pairs {
             if !self.entries.contains_key(&base_key) {
@@ -615,18 +614,18 @@ impl WeightStore {
             // `usize as f32` safe for small rank values; see `usize_to_f32`.
             let coeff = strength.mul_add(alpha / usize_to_f32(rank), 0.0_f32);
 
-            let delta = matmul_scaled(&b_f32, out_features, rank, &a_f32, in_features, coeff);
-
-            pending_deltas.push((base_key.clone(), delta));
+            pending_deltas.push((
+                base_key.clone(),
+                LowRankDelta {
+                    b: b_f32,
+                    a: a_f32,
+                    out_features,
+                    rank,
+                    in_features,
+                    scale: coeff,
+                },
+            ));
             report.matched_keys.push(base_key);
-        }
-
-        for (base_key, delta) in &pending_deltas {
-            if let Some(existing) = self.lora_deltas.get(base_key)
-                && existing.len() != delta.len()
-            {
-                return Err(WeightError::LoraShapeMismatch(base_key.clone()));
-            }
         }
 
         if report.matched_keys.is_empty() && !report.unmatched_lora_keys.is_empty() {
@@ -634,13 +633,7 @@ impl WeightStore {
         }
 
         for (base_key, delta) in pending_deltas {
-            let entry_delta = self
-                .lora_deltas
-                .entry(base_key)
-                .or_insert_with(|| vec![0.0f32; delta.len()]);
-            for (acc, d) in entry_delta.iter_mut().zip(delta.iter()) {
-                *acc += *d;
-            }
+            self.lora_deltas.entry(base_key).or_default().push(delta);
         }
 
         Ok(report)
@@ -755,37 +748,47 @@ fn usize_to_f32(val: usize) -> f32 {
     u32::try_from(val).map_or(f32::MAX, |v| v as f32)
 }
 
-/// Dense matrix multiply: `result[rows × cols] = scale * lhs[rows × inner] @ rhs[inner × cols]`.
-/// Row-major layout.  `lhs` is `B` from the `LoRA` formula; `rhs` is `A`.
-fn matmul_scaled(
-    lhs: &[f32],
-    rows: usize,
-    inner: usize,
-    rhs: &[f32],
-    cols: usize,
+/// One merged `LoRA` update `scale * (B @ A)` for a `[out, in]` weight.
+///
+/// Kept factored (`B: [out, rank]`, `A: [rank, in]`, as f32) so merging a `LoRA`
+/// into a large checkpoint costs about the `LoRA`'s own size (2x a bf16 file),
+/// not the size of every targeted weight.
+struct LowRankDelta {
+    b: Vec<f32>,
+    a: Vec<f32>,
+    out_features: usize,
+    rank: usize,
+    in_features: usize,
     scale: f32,
-) -> Vec<f32> {
-    let total = rows.saturating_mul(cols);
-    let mut out = vec![0.0f32; total];
-    for row in 0..rows {
-        for mid in 0..inner {
-            let bv = lhs
-                .get(row.saturating_mul(inner).saturating_add(mid))
-                .copied()
-                .unwrap_or(0.0_f32);
-            for col in 0..cols {
-                let av = rhs
-                    .get(mid.saturating_mul(cols).saturating_add(col))
-                    .copied()
-                    .unwrap_or(0.0_f32);
-                if let Some(slot) = out.get_mut(row.saturating_mul(cols).saturating_add(col)) {
-                    *slot = bv.mul_add(av, *slot);
+}
+
+impl LowRankDelta {
+    /// Add `scale * (B @ A)` to the row-major weight `weight` in place.
+    fn add_to(&self, weight: &mut [f32], key: &str) -> Result<(), WeightError> {
+        let mismatch = || WeightError::LoraShapeMismatch(key.to_owned());
+        let expected = self
+            .out_features
+            .checked_mul(self.in_features)
+            .ok_or_else(mismatch)?;
+        if weight.len() != expected
+            || self.b.len() != self.out_features.saturating_mul(self.rank)
+            || self.a.len() != self.rank.saturating_mul(self.in_features)
+            || self.in_features == 0
+            || self.rank == 0
+        {
+            return Err(mismatch());
+        }
+        for (weight_row, b_row) in weight
+            .chunks_exact_mut(self.in_features)
+            .zip(self.b.chunks_exact(self.rank))
+        {
+            for (b_value, a_row) in b_row.iter().zip(self.a.chunks_exact(self.in_features)) {
+                let coeff = self.scale * b_value;
+                for (w, a_value) in weight_row.iter_mut().zip(a_row) {
+                    *w = coeff.mul_add(*a_value, *w);
                 }
             }
         }
+        Ok(())
     }
-    for slot in &mut out {
-        *slot = scale.mul_add(*slot, 0.0_f32);
-    }
-    out
 }
