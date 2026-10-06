@@ -296,8 +296,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_float64_frequencies_precision() {
-        let mut config = DiTConfig::default();
-        config.frequencies_precision = Some("float64".to_owned());
+        let config = DiTConfig {
+            frequencies_precision: Some("float64".to_owned()),
+            ..DiTConfig::default()
+        };
         assert!(
             config.validate().is_err(),
             "float64 must be rejected to prevent silent f32/f64 RoPE divergence"
@@ -306,8 +308,10 @@ mod tests {
 
     #[test]
     fn validate_accepts_float32_and_none_frequencies_precision() {
-        let mut config = DiTConfig::default();
-        config.frequencies_precision = None;
+        let mut config = DiTConfig {
+            frequencies_precision: None,
+            ..DiTConfig::default()
+        };
         assert!(config.validate().is_ok());
         config.frequencies_precision = Some("float32".to_owned());
         assert!(config.validate().is_ok());

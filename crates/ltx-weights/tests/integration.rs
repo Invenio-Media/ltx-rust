@@ -500,6 +500,54 @@ fn lora_merge_basic() {
 }
 
 #[test]
+fn comfy_format_lora_matches_transformer_keys() {
+    // Real checkpoints store `model.diffusion_model.*`; KeyMap::transformer()
+    // strips that. ComfyUI LoRAs use `diffusion_model.*`, which the reference
+    // renaming map removes before matching.
+    let base_bytes = f32_bytes(&[1.0f32, 0.0, 0.0, 1.0]);
+    let sft = make_safetensors(
+        None,
+        &[(
+            "model.diffusion_model.blk.proj.weight",
+            &[2, 2],
+            "F32",
+            &base_bytes,
+        )],
+    );
+    let (_tmp, path) = write_tmp(&sft);
+    let lora_sft = make_safetensors(
+        None,
+        &[
+            (
+                "diffusion_model.blk.proj.lora_A.weight",
+                &[1, 2],
+                "F32",
+                &f32_bytes(&[1.0, 2.0]),
+            ),
+            (
+                "diffusion_model.blk.proj.lora_B.weight",
+                &[2, 1],
+                "F32",
+                &f32_bytes(&[3.0, 4.0]),
+            ),
+        ],
+    );
+    let (_lora_tmp, lora_path) = write_tmp(&lora_sft);
+
+    let mut store = WeightStore::open(&[&path], &KeyMap::transformer()).unwrap();
+    let report = store
+        .merge_lora(&LoraFile::open(&lora_path).unwrap(), 1.0)
+        .unwrap();
+
+    assert_eq!(report.matched_keys, ["blk.proj.weight"]);
+    let ht = store.read("blk.proj.weight").unwrap();
+    let expected = [4.0, 6.0, 4.0, 9.0];
+    for (got, want) in ht.data.iter().zip(expected) {
+        assert!((got - want).abs() < 1e-5, "{:?} != {expected:?}", ht.data);
+    }
+}
+
+#[test]
 fn lora_merge_with_alpha() {
     // Same base as above, but alpha=2, rank=1, so coeff = strength * alpha/rank = 1 * 2 = 2
     // delta = 2 * B @ A = [[6,12],[8,16]]

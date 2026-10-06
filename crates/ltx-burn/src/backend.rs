@@ -27,7 +27,7 @@ use crate::{
 /// Pure Burn implementation of [`AlphaBackend`].
 ///
 /// Construct via [`BurnBackend::load`].  Generic over the Burn backend `B`;
-/// typical choices are `NdArray<f32>` (CPU) and `Metal<half::bf16>` (Apple GPU).
+/// typical choices are `NdArray<f32>` (CPU) and `Metal<f32>` (Apple GPU).
 ///
 /// [`AlphaBackend`]: ltx_backend::AlphaBackend
 pub struct BurnBackend<B: Backend> {
@@ -138,7 +138,7 @@ impl<B: Backend> BurnBackend<B> {
         let positive_context: Tensor<B, 3> = ctx_scope.tensor("positive.video_encoding", device)?;
         let negative_context: Option<Tensor<B, 3>> =
             ctx_scope.optional("negative.video_encoding", device)?;
-        validate_settings(&settings, negative_context.is_some())?;
+        validate_settings(settings, negative_context.is_some())?;
 
         Ok(Self {
             transformer,

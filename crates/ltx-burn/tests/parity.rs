@@ -114,11 +114,6 @@ fn load_fixture_backend() -> (BurnBackend<B>, WeightStore, NdArrayDevice) {
     let dit_config =
         DiTConfig::from_json(tfm_cfg_json.get("transformer").unwrap_or(&tfm_cfg_json)).unwrap();
 
-    let kf_strength: f32 = store
-        .metadata("kf_strength")
-        .unwrap_or("0.95")
-        .parse()
-        .unwrap();
     let num_steps: u32 = store
         .metadata("num_inference_steps")
         .unwrap_or("2")
@@ -172,7 +167,7 @@ fn load_fixture_backend() -> (BurnBackend<B>, WeightStore, NdArrayDevice) {
         negative_context,
         ic_layout,
         settings,
-        device.clone(),
+        device,
     );
     (backend, store, device)
 }

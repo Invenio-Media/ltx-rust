@@ -34,7 +34,7 @@ alpha matte.
 ```sh
 python -W ignore tools/prompt_context.py \
   --transformer ltx-2.5-transformer.safetensors \
-  --text-encoder /path/to/gemma-9b \
+  --text-encoder /path/to/gemma \
   --prompt "generate alpha matte" \
   --out prompt_context.safetensors
 ```
@@ -49,7 +49,11 @@ cargo run --release -p ltx-cli -- input.mp4 out_mattes \
   --prompt-context prompt_context.safetensors
 ```
 
-### Inference (Apple Metal bf16)
+### Inference (Apple Metal, f32)
+
+Burn 0.21 on Metal cannot run bf16 matmul, so the `metal` feature computes in
+f32. The video transformer's f32 weights must fit in the GPU working set
+(about 107 GB on a 128 GB M4 Max).
 
 ```sh
 cargo run --release -p ltx-cli --features metal -- input.mp4 out_mattes \

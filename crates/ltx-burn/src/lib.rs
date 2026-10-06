@@ -28,7 +28,7 @@
 //! | Cargo feature | Backend |
 //! |---|---|
 //! | `ndarray` (default) | CPU `NdArray<f32>` |
-//! | `metal` | Apple Metal `Metal<half::bf16>` |
+//! | `metal` | Apple Metal `Metal<f32>` (Burn 0.21 Metal has no bf16 matmul) |
 //! | `cuda` | NVIDIA CUDA `Cuda<half::bf16>` |
 //!
 //! [`VideoReferenceCondition`]: ltx_sampler::VideoReferenceCondition
