@@ -1,0 +1,21 @@
+[package]
+name = "ltx-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line interface for the LTX alpha matte pipeline."
+
+[[bin]]
+name = "ltx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
+ltx-backend = { path = "../ltx-backend" }
+ltx-pipeline = { path = "../ltx-pipeline" }
+
+[lints]
+workspace = true
