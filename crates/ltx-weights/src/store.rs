@@ -470,7 +470,8 @@ impl WeightStore {
     ///
     /// All dtypes (F32, F16, BF16, FP8) are dequantized.  If a sibling
     /// `{key}_scale` entry exists, the scale is applied before returning.
-    /// Any merged `LoRA` delta is added.
+    /// Any merged `LoRA` update is added; it is expanded from its low-rank
+    /// factors on every call (`O(out · in · rank)` per merged `LoRA`).
     ///
     /// # Errors
     ///
@@ -749,8 +750,9 @@ fn usize_to_f32(val: usize) -> f32 {
 
 /// One merged `LoRA` update `scale * (B @ A)` for a `[out, in]` weight.
 ///
-/// Kept factored (`B: [out, rank]`, `A: [rank, in]`) so merging a `LoRA` into a
-/// large checkpoint costs only the `LoRA` file's size in memory.
+/// Kept factored (`B: [out, rank]`, `A: [rank, in]`, as f32) so merging a `LoRA`
+/// into a large checkpoint costs about the `LoRA`'s own size (2x a bf16 file),
+/// not the size of every targeted weight.
 struct LowRankDelta {
     b: Vec<f32>,
     a: Vec<f32>,
