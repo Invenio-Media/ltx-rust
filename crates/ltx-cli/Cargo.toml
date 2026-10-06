@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
 ltx-backend = { path = "../ltx-backend" }
 ltx-pipeline = { path = "../ltx-pipeline" }
 

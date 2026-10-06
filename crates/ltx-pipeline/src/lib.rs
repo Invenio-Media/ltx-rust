@@ -41,6 +41,18 @@ impl Default for PipelineConfig {
     }
 }
 
+impl PipelineConfig {
+    /// Check the chunk length and overlap rules that the chunk planner and
+    /// blender enforce, without touching any input.
+    ///
+    /// # Errors
+    /// Returns [`ChunkError`] when `chunk_len` is not `8k + 1`, `overlap` is
+    /// not a multiple of 8, or the stride is smaller than the overlap.
+    pub fn validate(&self) -> Result<(), ChunkError> {
+        Blender::new(self.chunk_len, self.overlap, 1, 1).map(drop)
+    }
+}
+
 /// Summary of a completed pipeline run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineReport {
@@ -101,6 +113,7 @@ pub fn run_video<B: AlphaBackend>(
     output_dir: &Path,
     config: &PipelineConfig,
 ) -> Result<PipelineReport, PipelineError> {
+    config.validate()?;
     let metadata = ltx_io::probe(input)?;
     if metadata.frame_count == 0 {
         return Err(PipelineError::EmptyInput);
