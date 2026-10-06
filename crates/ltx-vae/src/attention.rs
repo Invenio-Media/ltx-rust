@@ -12,7 +12,7 @@
 //! is equivalent to RMS normalisation with a learnable per-channel gain.
 
 use burn::{
-    module::Module,
+    module::{Module, Param},
     nn::{
         PaddingConfig2d,
         conv::{Conv2d, Conv2dConfig},
@@ -49,6 +49,22 @@ impl<B: Backend> RmsNorm2d<B> {
         let normalised = x.div(rms);
         let gamma = self.gamma.clone().unsqueeze::<4>();
         normalised.mul(gamma)
+    }
+
+    /// Load `gamma` from a [`ltx_weights::Scope`].
+    ///
+    /// Reads `gamma` (shape `[C, 1, 1]`) matching the reference
+    /// `_RMSNorm2D.state_dict()` key name.
+    ///
+    /// # Errors
+    /// Returns [`VaeError::Load`] if the tensor is missing or wrong rank.
+    fn load_weights_from_scope(
+        &mut self,
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<(), VaeError> {
+        self.gamma = scope.tensor("gamma", device)?;
+        Ok(())
     }
 }
 
@@ -148,5 +164,28 @@ impl<B: Backend> AttnBlock3D<B> {
         let out5: Tensor<B, 5> = out4.reshape([nb, nt, nc, nh, nw]).swap_dims(1, 2);
 
         Ok(identity.add(out5))
+    }
+
+    /// Load all parameters from a [`ltx_weights::Scope`].
+    ///
+    /// Key names match the reference `AttnBlock3D.state_dict()`:
+    /// - `norm.gamma`
+    /// - `to_qkv.weight`, `to_qkv.bias`
+    /// - `proj.weight`, `proj.bias`
+    ///
+    /// # Errors
+    /// Returns [`VaeError::Load`] if any tensor is missing or wrong rank.
+    pub(crate) fn load_weights_from_scope(
+        &mut self,
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<(), VaeError> {
+        self.norm
+            .load_weights_from_scope(&scope.scope("norm"), device)?;
+        self.to_qkv.weight = Param::from_tensor(scope.tensor("to_qkv.weight", device)?);
+        self.to_qkv.bias = Some(Param::from_tensor(scope.tensor("to_qkv.bias", device)?));
+        self.proj.weight = Param::from_tensor(scope.tensor("proj.weight", device)?);
+        self.proj.bias = Some(Param::from_tensor(scope.tensor("proj.bias", device)?));
+        Ok(())
     }
 }

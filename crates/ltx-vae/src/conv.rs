@@ -9,7 +9,7 @@
 //! dimensions use zero-padding (only `"zeros"` mode is supported).
 
 use burn::{
-    module::Module,
+    module::{Module, Param},
     nn::{
         PaddingConfig3d,
         conv::{Conv3d, Conv3dConfig},
@@ -84,6 +84,26 @@ impl<B: Backend> CausalConv3d<B> {
             time_kernel_size: kernel_size,
             time_dilation: dilation,
         })
+    }
+
+    /// Load convolution weights from a [`ltx_weights::Scope`].
+    ///
+    /// Reads `conv.weight` and, when bias is enabled, `conv.bias` relative to
+    /// `scope`.  Key names match the reference `CausalConv3d.state_dict()`.
+    ///
+    /// # Errors
+    /// Returns [`crate::VaeError::Load`] if any tensor is missing or has the
+    /// wrong rank.
+    pub(crate) fn load_weights_from_scope(
+        &mut self,
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<(), crate::error::VaeError> {
+        self.conv.weight = Param::from_tensor(scope.tensor("conv.weight", device)?);
+        if self.conv.bias.is_some() {
+            self.conv.bias = Some(Param::from_tensor(scope.tensor("conv.bias", device)?));
+        }
+        Ok(())
     }
 
     /// Forward pass.

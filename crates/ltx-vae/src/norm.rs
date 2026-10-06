@@ -10,7 +10,7 @@
 //! Reference commit: 9ec55f9.
 
 use burn::{
-    module::Module,
+    module::{Module, Param},
     nn::GroupNorm,
     tensor::{Tensor, backend::Backend},
 };
@@ -75,6 +75,30 @@ impl<B: Backend> NormLayer<B> {
     }
 }
 
+impl<B: Backend> NormLayer<B> {
+    /// Load affine parameters from a [`ltx_weights::Scope`] (no-op for [`PixelNorm`]).
+    ///
+    /// For `GroupNorm`, reads `weight` → `gamma` and `bias` → `beta` relative
+    /// to `scope` (matching `nn.GroupNorm.state_dict()` key names).
+    ///
+    /// # Errors
+    /// Returns [`crate::VaeError::Load`] if any tensor is missing or wrong rank.
+    pub(crate) fn load_weights_from_scope(
+        &mut self,
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<(), crate::error::VaeError> {
+        match self {
+            Self::Pixel(_) => {}
+            Self::Group(gn) => {
+                gn.gamma = Some(Param::from_tensor(scope.tensor("weight", device)?));
+                gn.beta = Some(Param::from_tensor(scope.tensor("bias", device)?));
+            }
+        }
+        Ok(())
+    }
+}
+
 // ── PerChannelStatistics ──────────────────────────────────────────────────────
 
 /// Dataset-level per-channel mean and standard deviation for latent
@@ -119,5 +143,24 @@ impl<B: Backend> PerChannelStatistics<B> {
         let mean = self.mean_of_means.clone().reshape([1, nc, 1, 1, 1]);
         let std = self.std_of_means.clone().reshape([1, nc, 1, 1, 1]);
         x.mul(std).add(mean)
+    }
+
+    /// Load statistics from a [`ltx_weights::Scope`].
+    ///
+    /// Reads `std-of-means` and `mean-of-means` relative to `scope` (hyphens
+    /// preserved, matching the reference `PerChannelStatistics.state_dict()` keys).
+    ///
+    /// # Errors
+    /// Returns [`crate::VaeError::Load`] if any tensor is missing or wrong rank.
+    pub(crate) fn load_from_scope(
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<Self, crate::error::VaeError> {
+        let std_of_means = scope.tensor("std-of-means", device)?;
+        let mean_of_means = scope.tensor("mean-of-means", device)?;
+        Ok(Self {
+            std_of_means,
+            mean_of_means,
+        })
     }
 }

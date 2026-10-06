@@ -90,6 +90,34 @@ impl<B: Backend> EncoderBlock<B> {
     }
 }
 
+impl<B: Backend> EncoderBlock<B> {
+    /// Load weights from a [`ltx_weights::Scope`].
+    ///
+    /// Dispatches to the block-specific loader.  Key paths match the
+    /// reference `VideoEncoder.down_blocks[i].state_dict()` names.
+    ///
+    /// # Errors
+    /// Returns [`VaeError::Load`] if any tensor is missing or wrong rank.
+    pub(crate) fn load_weights_from_scope(
+        &mut self,
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<(), VaeError> {
+        match self {
+            Self::ResX(b) => b.load_weights_from_scope(scope, device),
+            Self::ResXY(b) => b.load_weights_from_scope(scope, device),
+            Self::CompressTime(b)
+            | Self::CompressSpace(b)
+            | Self::CompressAll(b)
+            | Self::CompressAllXY(b) => b.load_weights_from_scope(scope, device),
+            Self::CompressAllRes(b) | Self::CompressSpaceRes(b) | Self::CompressTimeRes(b) => {
+                b.load_weights_from_scope(scope, device)
+            }
+            Self::Attn(b) => b.load_weights_from_scope(scope, device),
+        }
+    }
+}
+
 // ── VideoEncoder ──────────────────────────────────────────────────────────────
 
 /// LTX-2.5 video VAE encoder.
@@ -385,6 +413,63 @@ impl<B: Backend> VideoEncoder<B> {
     #[must_use]
     pub const fn latent_channels(&self) -> usize {
         self.latent_channels
+    }
+}
+
+impl<B: Backend> VideoEncoder<B> {
+    /// Build a `VideoEncoder` from checkpoint weights.
+    ///
+    /// # Key mapping
+    ///
+    /// For parity fixtures saved with `module.state_dict()` names, open the
+    /// [`ltx_weights::WeightStore`] with [`ltx_weights::KeyMap::identity`] and
+    /// pass the root scope.  For real LTX-2.5 diffusion-VAE checkpoints, open
+    /// with [`ltx_weights::KeyMap::video_encoder`]; the encoder lives under the
+    /// empty scope after the map strips `vae.encoder.` / `encoder.` prefixes.
+    /// Per-channel statistics live at `per_channel_statistics.*` in both cases.
+    ///
+    /// # Conv weight layout
+    ///
+    /// `CausalConv3d` and all conv blocks store weights as `PyTorch`
+    /// `[out, in/groups, kT, kH, kW]` — Burn uses the same layout for 3-D
+    /// convolutions, so no transposition is applied.
+    ///
+    /// # Errors
+    /// Returns [`VaeError`] if construction fails or any weight tensor is
+    /// missing / has the wrong rank.
+    pub fn load(
+        scope: &ltx_weights::Scope<'_>,
+        config: &VaeEncoderConfig,
+        device: &B::Device,
+    ) -> Result<Self, VaeError> {
+        let mut encoder = Self::new(config, device)?;
+
+        // ── per-channel normalisation statistics ──────────────────────────────
+        let stats_scope = scope.scope("per_channel_statistics");
+        encoder.per_channel_statistics =
+            PerChannelStatistics::load_from_scope(&stats_scope, device)?;
+
+        // ── conv_in ───────────────────────────────────────────────────────────
+        encoder
+            .conv_in
+            .load_weights_from_scope(&scope.scope("conv_in"), device)?;
+
+        // ── encoder blocks ────────────────────────────────────────────────────
+        for (i, block) in encoder.down_blocks.iter_mut().enumerate() {
+            block.load_weights_from_scope(&scope.scope(&format!("down_blocks.{i}")), device)?;
+        }
+
+        // ── conv_norm_out (PixelNorm: no params; GroupNorm: weight + bias) ────
+        encoder
+            .conv_norm_out
+            .load_weights_from_scope(&scope.scope("conv_norm_out"), device)?;
+
+        // ── conv_out ──────────────────────────────────────────────────────────
+        encoder
+            .conv_out
+            .load_weights_from_scope(&scope.scope("conv_out"), device)?;
+
+        Ok(encoder)
     }
 }
 

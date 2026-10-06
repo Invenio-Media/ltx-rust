@@ -7,7 +7,7 @@
 //! no noise injection, no dropout).
 
 use burn::{
-    module::Module,
+    module::{Module, Param},
     nn::{
         PaddingConfig3d,
         conv::{Conv3d, Conv3dConfig},
@@ -147,6 +147,44 @@ impl<B: Backend> ResnetBlock3D<B> {
 
         residual.add(h)
     }
+
+    /// Load all parameters from a [`ltx_weights::Scope`].
+    ///
+    /// Key names match the reference `ResnetBlock3D.state_dict()`:
+    /// - `conv1.conv.weight`, `conv1.conv.bias`
+    /// - `conv2.conv.weight`, `conv2.conv.bias`
+    /// - `conv_shortcut.weight`, `conv_shortcut.bias` (when channels change)
+    /// - `norm3.weight`, `norm3.bias` (when channels change)
+    /// - `norm1.weight`, `norm1.bias` (when using `GroupNorm`)
+    /// - `norm2.weight`, `norm2.bias` (when using `GroupNorm`)
+    ///
+    /// # Errors
+    /// Returns [`VaeError::Load`] if any expected tensor is missing or wrong rank.
+    pub(crate) fn load_weights_from_scope(
+        &mut self,
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<(), VaeError> {
+        self.norm1
+            .load_weights_from_scope(&scope.scope("norm1"), device)?;
+        self.conv1
+            .load_weights_from_scope(&scope.scope("conv1"), device)?;
+        self.norm2
+            .load_weights_from_scope(&scope.scope("norm2"), device)?;
+        self.conv2
+            .load_weights_from_scope(&scope.scope("conv2"), device)?;
+        if let Some(sc) = &mut self.shortcut_conv {
+            sc.conv.weight = Param::from_tensor(scope.tensor("conv_shortcut.weight", device)?);
+            sc.conv.bias = Some(Param::from_tensor(
+                scope.tensor("conv_shortcut.bias", device)?,
+            ));
+        }
+        if let Some(sn) = &mut self.shortcut_norm {
+            sn.gamma = Some(Param::from_tensor(scope.tensor("norm3.weight", device)?));
+            sn.beta = Some(Param::from_tensor(scope.tensor("norm3.bias", device)?));
+        }
+        Ok(())
+    }
 }
 
 // ── UNetMidBlock3D ────────────────────────────────────────────────────────────
@@ -192,6 +230,24 @@ impl<B: Backend> UNetMidBlock3D<B> {
             x = block.forward(x);
         }
         x
+    }
+
+    /// Load all parameters from a [`ltx_weights::Scope`].
+    ///
+    /// Reads `res_blocks.{i}.*` for each block, matching the reference
+    /// `UNetMidBlock3D.state_dict()` key names.
+    ///
+    /// # Errors
+    /// Returns [`VaeError::Load`] if any tensor is missing or wrong rank.
+    pub(crate) fn load_weights_from_scope(
+        &mut self,
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<(), VaeError> {
+        for (i, block) in self.res_blocks.iter_mut().enumerate() {
+            block.load_weights_from_scope(&scope.scope(&format!("res_blocks.{i}")), device)?;
+        }
+        Ok(())
     }
 }
 
