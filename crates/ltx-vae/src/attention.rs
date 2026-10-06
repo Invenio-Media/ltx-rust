@@ -12,7 +12,7 @@
 //! is equivalent to RMS normalisation with a learnable per-channel gain.
 
 use burn::{
-    module::{Module, Param},
+    module::Module,
     nn::{
         PaddingConfig2d,
         conv::{Conv2d, Conv2dConfig},
@@ -57,13 +57,15 @@ impl<B: Backend> RmsNorm2d<B> {
     /// `_RMSNorm2D.state_dict()` key name.
     ///
     /// # Errors
-    /// Returns [`VaeError::Load`] if the tensor is missing or wrong rank.
+    /// Returns [`VaeError::Load`] if the tensor is missing or wrong rank, or
+    /// [`VaeError::Config`] if its shape does not match.
     fn load_weights_from_scope(
         &mut self,
         scope: &ltx_weights::Scope<'_>,
         device: &B::Device,
     ) -> Result<(), VaeError> {
-        self.gamma = scope.tensor("gamma", device)?;
+        let exp = self.gamma.dims();
+        self.gamma = crate::load_util::load_tensor::<B, 3>(scope, "gamma", &exp, device)?;
         Ok(())
     }
 }
@@ -174,18 +176,43 @@ impl<B: Backend> AttnBlock3D<B> {
     /// - `proj.weight`, `proj.bias`
     ///
     /// # Errors
-    /// Returns [`VaeError::Load`] if any tensor is missing or wrong rank.
+    /// Returns [`VaeError::Load`] if any tensor is missing or wrong rank, or
+    /// [`VaeError::Config`] if a shape does not match.
     pub(crate) fn load_weights_from_scope(
         &mut self,
         scope: &ltx_weights::Scope<'_>,
         device: &B::Device,
     ) -> Result<(), VaeError> {
+        // Collect expected shapes before mutable assignments.
+        let exp_qkv_w = self.to_qkv.weight.lazy_shape().to_vec();
+        let exp_qkv_b: Option<Vec<usize>> =
+            self.to_qkv.bias.as_ref().map(|p| p.lazy_shape().to_vec());
+        let exp_proj_w = self.proj.weight.lazy_shape().to_vec();
+        let exp_proj_b: Option<Vec<usize>> =
+            self.proj.bias.as_ref().map(|p| p.lazy_shape().to_vec());
+
         self.norm
             .load_weights_from_scope(&scope.scope("norm"), device)?;
-        self.to_qkv.weight = Param::from_tensor(scope.tensor("to_qkv.weight", device)?);
-        self.to_qkv.bias = Some(Param::from_tensor(scope.tensor("to_qkv.bias", device)?));
-        self.proj.weight = Param::from_tensor(scope.tensor("proj.weight", device)?);
-        self.proj.bias = Some(Param::from_tensor(scope.tensor("proj.bias", device)?));
+        self.to_qkv.weight =
+            crate::load_util::load_param::<B, 4>(scope, "to_qkv.weight", &exp_qkv_w, device)?;
+        if let Some(exp) = exp_qkv_b {
+            self.to_qkv.bias = Some(crate::load_util::load_param::<B, 1>(
+                scope,
+                "to_qkv.bias",
+                &exp,
+                device,
+            )?);
+        }
+        self.proj.weight =
+            crate::load_util::load_param::<B, 4>(scope, "proj.weight", &exp_proj_w, device)?;
+        if let Some(exp) = exp_proj_b {
+            self.proj.bias = Some(crate::load_util::load_param::<B, 1>(
+                scope,
+                "proj.bias",
+                &exp,
+                device,
+            )?);
+        }
         Ok(())
     }
 }

@@ -9,7 +9,7 @@
 //! dimensions use zero-padding (only `"zeros"` mode is supported).
 
 use burn::{
-    module::{Module, Param},
+    module::Module,
     nn::{
         PaddingConfig3d,
         conv::{Conv3d, Conv3dConfig},
@@ -93,15 +93,26 @@ impl<B: Backend> CausalConv3d<B> {
     ///
     /// # Errors
     /// Returns [`crate::VaeError::Load`] if any tensor is missing or has the
-    /// wrong rank.
+    /// wrong rank, or [`crate::VaeError::Config`] if its shape does not match
+    /// the config-derived expectation.
     pub(crate) fn load_weights_from_scope(
         &mut self,
         scope: &ltx_weights::Scope<'_>,
         device: &B::Device,
     ) -> Result<(), crate::error::VaeError> {
-        self.conv.weight = Param::from_tensor(scope.tensor("conv.weight", device)?);
-        if self.conv.bias.is_some() {
-            self.conv.bias = Some(Param::from_tensor(scope.tensor("conv.bias", device)?));
+        // Collect expected shapes first so there are no active borrows when
+        // we assign the replacement tensors.
+        let exp_w = self.conv.weight.lazy_shape().to_vec();
+        let exp_b: Option<Vec<usize>> = self.conv.bias.as_ref().map(|p| p.lazy_shape().to_vec());
+        self.conv.weight =
+            crate::load_util::load_param::<B, 5>(scope, "conv.weight", &exp_w, device)?;
+        if let Some(exp) = exp_b {
+            self.conv.bias = Some(crate::load_util::load_param::<B, 1>(
+                scope,
+                "conv.bias",
+                &exp,
+                device,
+            )?);
         }
         Ok(())
     }

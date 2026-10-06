@@ -10,7 +10,7 @@
 //! Reference commit: 9ec55f9.
 
 use burn::{
-    module::{Module, Param},
+    module::Module,
     nn::GroupNorm,
     tensor::{Tensor, backend::Backend},
 };
@@ -81,8 +81,8 @@ impl<B: Backend> NormLayer<B> {
     /// For `GroupNorm`, reads `weight` → `gamma` and `bias` → `beta` relative
     /// to `scope` (matching `nn.GroupNorm.state_dict()` key names).
     ///
-    /// # Errors
-    /// Returns [`crate::VaeError::Load`] if any tensor is missing or wrong rank.
+    /// Returns [`crate::VaeError::Load`] if any tensor is missing or wrong rank,
+    /// or [`crate::VaeError::Config`] if a shape does not match the config.
     pub(crate) fn load_weights_from_scope(
         &mut self,
         scope: &ltx_weights::Scope<'_>,
@@ -91,8 +91,19 @@ impl<B: Backend> NormLayer<B> {
         match self {
             Self::Pixel(_) => {}
             Self::Group(gn) => {
-                gn.gamma = Some(Param::from_tensor(scope.tensor("weight", device)?));
-                gn.beta = Some(Param::from_tensor(scope.tensor("bias", device)?));
+                // Collect expected shapes before mutable assignment.
+                let exp_g: Option<Vec<usize>> = gn.gamma.as_ref().map(|p| p.lazy_shape().to_vec());
+                let exp_b: Option<Vec<usize>> = gn.beta.as_ref().map(|p| p.lazy_shape().to_vec());
+                if let Some(exp) = exp_g {
+                    gn.gamma = Some(crate::load_util::load_param::<B, 1>(
+                        scope, "weight", &exp, device,
+                    )?);
+                }
+                if let Some(exp) = exp_b {
+                    gn.beta = Some(crate::load_util::load_param::<B, 1>(
+                        scope, "bias", &exp, device,
+                    )?);
+                }
             }
         }
         Ok(())

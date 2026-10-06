@@ -423,10 +423,15 @@ impl<B: Backend> VideoEncoder<B> {
     ///
     /// For parity fixtures saved with `module.state_dict()` names, open the
     /// [`ltx_weights::WeightStore`] with [`ltx_weights::KeyMap::identity`] and
-    /// pass the root scope.  For real LTX-2.5 diffusion-VAE checkpoints, open
-    /// with [`ltx_weights::KeyMap::video_encoder`]; the encoder lives under the
-    /// empty scope after the map strips `vae.encoder.` / `encoder.` prefixes.
-    /// Per-channel statistics live at `per_channel_statistics.*` in both cases.
+    /// pass the root scope.
+    ///
+    /// For real LTX-2.5 diffusion-VAE checkpoints, open with
+    /// [`ltx_weights::KeyMap::video_encoder`]; the map strips `vae.encoder.` /
+    /// `encoder.` prefixes and renames `vae.per_channel_statistics.*` →
+    /// `per_channel_statistics.*`, after which call this function with the
+    /// root scope.  This code path follows the reference `VAE_ENCODER_COMFY_KEYS_FILTER`
+    /// `SDOps` exactly; it is documented but not integration-tested in this crate
+    /// (no real Lightricks checkpoint is available locally).
     ///
     /// # Conv weight layout
     ///
@@ -435,8 +440,9 @@ impl<B: Backend> VideoEncoder<B> {
     /// convolutions, so no transposition is applied.
     ///
     /// # Errors
-    /// Returns [`VaeError`] if construction fails or any weight tensor is
-    /// missing / has the wrong rank.
+    /// Returns [`VaeError`] if construction fails, if any weight tensor is
+    /// missing or has the wrong rank, or if a loaded shape does not match the
+    /// config-derived expectation.
     pub fn load(
         scope: &ltx_weights::Scope<'_>,
         config: &VaeEncoderConfig,
@@ -446,8 +452,16 @@ impl<B: Backend> VideoEncoder<B> {
 
         // ── per-channel normalisation statistics ──────────────────────────────
         let stats_scope = scope.scope("per_channel_statistics");
-        encoder.per_channel_statistics =
-            PerChannelStatistics::load_from_scope(&stats_scope, device)?;
+        let stats = PerChannelStatistics::load_from_scope(&stats_scope, device)?;
+        // Validate that the checkpoint's latent channel count matches the config.
+        let got_ch = stats.std_of_means.dims()[0];
+        if got_ch != config.out_channels {
+            return Err(VaeError::Config(format!(
+                "`per_channel_statistics.std-of-means`: expected [{0}], got [{1}]",
+                config.out_channels, got_ch
+            )));
+        }
+        encoder.per_channel_statistics = stats;
 
         // ── conv_in ───────────────────────────────────────────────────────────
         encoder

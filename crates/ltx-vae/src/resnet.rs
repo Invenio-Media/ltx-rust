@@ -7,7 +7,7 @@
 //! no noise injection, no dropout).
 
 use burn::{
-    module::{Module, Param},
+    module::Module,
     nn::{
         PaddingConfig3d,
         conv::{Conv3d, Conv3dConfig},
@@ -174,14 +174,42 @@ impl<B: Backend> ResnetBlock3D<B> {
         self.conv2
             .load_weights_from_scope(&scope.scope("conv2"), device)?;
         if let Some(sc) = &mut self.shortcut_conv {
-            sc.conv.weight = Param::from_tensor(scope.tensor("conv_shortcut.weight", device)?);
-            sc.conv.bias = Some(Param::from_tensor(
-                scope.tensor("conv_shortcut.bias", device)?,
-            ));
+            let exp_w = sc.conv.weight.lazy_shape().to_vec();
+            let exp_b: Option<Vec<usize>> = sc.conv.bias.as_ref().map(|p| p.lazy_shape().to_vec());
+            sc.conv.weight = crate::load_util::load_param::<B, 5>(
+                scope,
+                "conv_shortcut.weight",
+                &exp_w,
+                device,
+            )?;
+            if let Some(exp) = exp_b {
+                sc.conv.bias = Some(crate::load_util::load_param::<B, 1>(
+                    scope,
+                    "conv_shortcut.bias",
+                    &exp,
+                    device,
+                )?);
+            }
         }
         if let Some(sn) = &mut self.shortcut_norm {
-            sn.gamma = Some(Param::from_tensor(scope.tensor("norm3.weight", device)?));
-            sn.beta = Some(Param::from_tensor(scope.tensor("norm3.bias", device)?));
+            let exp_g: Option<Vec<usize>> = sn.gamma.as_ref().map(|p| p.lazy_shape().to_vec());
+            let exp_b: Option<Vec<usize>> = sn.beta.as_ref().map(|p| p.lazy_shape().to_vec());
+            if let Some(exp) = exp_g {
+                sn.gamma = Some(crate::load_util::load_param::<B, 1>(
+                    scope,
+                    "norm3.weight",
+                    &exp,
+                    device,
+                )?);
+            }
+            if let Some(exp) = exp_b {
+                sn.beta = Some(crate::load_util::load_param::<B, 1>(
+                    scope,
+                    "norm3.bias",
+                    &exp,
+                    device,
+                )?);
+            }
         }
         Ok(())
     }

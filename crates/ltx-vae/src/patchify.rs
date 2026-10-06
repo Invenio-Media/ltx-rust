@@ -147,24 +147,27 @@ pub fn unpatchify<B: Backend>(
     let nh = h_out.checked_mul(patch_size).ok_or(VaeError::DimOverflow)?;
     let nw = w_out.checked_mul(patch_size).ok_or(VaeError::DimOverflow)?;
 
-    // Step 1: (B, C_out, F, h_out, w_out) → (B, F, C_out, h_out, w_out)
+    // Step 1: (B, C_in, F, h_out, w_out) → (B, F, C_in, h_out, w_out)
     let x = x.swap_dims(1, 2);
 
-    // Step 2: → (B·F, C_out, h_out, w_out) [4-D]
+    // Step 2: → (B·F, C_in, h_out, w_out) [4-D]
     let x4: Tensor<B, 4> = x.reshape([bf, c_in, h_out, w_out]);
 
     // Step 3: → (B·F·C, r, q, h_out, w_out) — inverse of step 5 in patchify.
+    // C_in = C * r_max * q_max; split into (B·F·C, r_max, q_max, h_out, w_out).
     let x5: Tensor<B, 5> = x4.reshape([bfc, patch_size, patch_size, h_out, w_out]);
 
     // Steps 4–5: inverse permutation of patchify steps 3–4.
-    //   [bfc, r, q, h_out, w_out]
-    //   swap(3,4) → [bfc, r, q, w_out, h_out]
-    //   swap(1,4) → [bfc, h_out, q, w_out, r]
+    //   [bfc, r_idx, q_idx, h_out, w_out]
+    //   swap(3,4) → [bfc, r_idx, q_idx, w_out, h_out]
+    //   swap(1,4) → [bfc, h_out, q_idx, w_out, r_idx]
     let x5 = x5.swap_dims(3, 4);
     let x5 = x5.swap_dims(1, 4);
-    // Step 6: (B·F·C, h_out, q, w_out, r) → (B·F·C, H, W)
-    //   The flat layout h*(q·w_out·r) + q*(w_out·r) + w·r + r correctly maps
-    //   to H=h·q_max+q and W=w·r_max+r, so the 5→3-D reshape is valid.
+
+    // Step 6: (B·F·C, h_out, q_idx, w_out, r_idx) → (B·F·C, H, W)
+    //   Row-major flat position h*(q·w_out·r) + q_idx*(w_out·r) + w*r + r_idx
+    //   maps to H = h·q_max + q_idx and W = w·r_max + r_idx, so the
+    //   5→3-D collapse is valid.
     let x3: Tensor<B, 3> = x5.reshape([bfc, nh, nw]);
 
     // Step 7: (B·F·C, H, W) → (B, F, C, H, W) → (B, C, F, H, W)

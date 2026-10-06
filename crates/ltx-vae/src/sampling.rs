@@ -196,7 +196,12 @@ fn fold_temporal<B: Backend>(x: Tensor<B, 5>, stride_t: usize) -> Result<Tensor<
 /// mixing with the height-stride index during the intermediate reshape.
 fn fold_height<B: Backend>(x: Tensor<B, 5>, stride_h: usize) -> Result<Tensor<B, 5>, VaeError> {
     let [nb, nc, nf, h_in, nw] = x.dims();
-    let h_out = h_in.checked_div(stride_h).ok_or(VaeError::DimOverflow)?;
+    let h_out = h_in
+        .checked_div(stride_h)
+        .filter(|&v| v.checked_mul(stride_h) == Some(h_in))
+        .ok_or_else(|| {
+            VaeError::Config(format!("H={h_in} is not divisible by stride_h={stride_h}"))
+        })?;
     let c_out = nc.checked_mul(stride_h).ok_or(VaeError::DimOverflow)?;
     let bf = nb.checked_mul(nf).ok_or(VaeError::DimOverflow)?;
 
@@ -223,7 +228,12 @@ fn fold_height<B: Backend>(x: Tensor<B, 5>, stride_h: usize) -> Result<Tensor<B,
 /// mixing with the width-stride index during the intermediate reshape.
 fn fold_width<B: Backend>(x: Tensor<B, 5>, stride_w: usize) -> Result<Tensor<B, 5>, VaeError> {
     let [nb, nc, nf, nh, w_in] = x.dims();
-    let w_out = w_in.checked_div(stride_w).ok_or(VaeError::DimOverflow)?;
+    let w_out = w_in
+        .checked_div(stride_w)
+        .filter(|&v| v.checked_mul(stride_w) == Some(w_in))
+        .ok_or_else(|| {
+            VaeError::Config(format!("W={w_in} is not divisible by stride_w={stride_w}"))
+        })?;
     let c_out = nc.checked_mul(stride_w).ok_or(VaeError::DimOverflow)?;
     let bf = nb.checked_mul(nf).ok_or(VaeError::DimOverflow)?;
 
