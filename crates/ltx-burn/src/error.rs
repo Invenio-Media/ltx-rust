@@ -61,4 +61,12 @@ pub enum BurnError {
          Burn does not expose device-allocator statistics"
     )]
     ProbeNotSupported,
+
+    /// `cfg_scale != 1.0` requires a negative context in the prompt-context
+    /// file, but `negative.video_encoding` is absent.
+    #[error(
+        "cfg_scale {cfg_scale} requires a negative context but \
+         negative.video_encoding is absent from the prompt-context file"
+    )]
+    MissingNegativeContext { cfg_scale: f32 },
 }

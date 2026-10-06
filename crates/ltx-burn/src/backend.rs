@@ -138,6 +138,15 @@ impl<B: Backend> BurnBackend<B> {
         let positive_context: Tensor<B, 3> = ctx_scope.tensor("positive.video_encoding", device)?;
         let negative_context: Option<Tensor<B, 3>> =
             ctx_scope.optional("negative.video_encoding", device)?;
+        // Fail early when cfg_scale != 1 but no negative context was provided.
+        // This prevents a per-chunk failure after all expensive encodes have run.
+        if ltx_sampler::GuiderParams::alpha_gen(settings.cfg_scale).needs_uncond()
+            && negative_context.is_none()
+        {
+            return Err(BurnError::MissingNegativeContext {
+                cfg_scale: settings.cfg_scale,
+            });
+        }
 
         Ok(Self {
             transformer,
@@ -191,10 +200,9 @@ impl<B: Backend> BurnBackend<B> {
 
 impl<B: Backend> AlphaBackend for BurnBackend<B> {
     fn probe(&self, _shape: ltx_shape::PixelShape) -> Result<MemSample, BackendError> {
-        Err(BackendError::RunnerError {
-            msg: BurnError::ProbeNotSupported.to_string(),
-            stderr: String::new(),
-        })
+        Err(BackendError::Unsupported(
+            BurnError::ProbeNotSupported.to_string(),
+        ))
     }
 
     fn run_chunk(
