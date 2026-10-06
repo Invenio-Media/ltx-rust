@@ -16,6 +16,10 @@ use burn::tensor::DType;
 /// `y = x / sqrt(mean(x²) + eps)`
 ///
 /// Computation is promoted to f32 and cast back to the input dtype.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "Burn tensor operators run on the compute backend; no integer overflow possible"
+)]
 pub fn rms_norm<B: Backend, const D: usize>(x: Tensor<B, D>, eps: f32) -> Tensor<B, D> {
     let dtype = x.dtype();
     let last = D.saturating_sub(1);
@@ -35,6 +39,10 @@ pub fn rms_norm<B: Backend, const D: usize>(x: Tensor<B, D>, eps: f32) -> Tensor
 /// `y = (x - mean(x)) / sqrt(var(x) + eps)`
 ///
 /// Equivalent to `F.layer_norm(x, (d,), weight=None, bias=None, eps=eps)`.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "Burn tensor operators run on the compute backend; no integer overflow possible"
+)]
 pub fn layer_norm_no_affine<B: Backend, const D: usize>(x: Tensor<B, D>, eps: f32) -> Tensor<B, D> {
     let last = D.saturating_sub(1);
     let mean = x.clone().mean_dim(last);

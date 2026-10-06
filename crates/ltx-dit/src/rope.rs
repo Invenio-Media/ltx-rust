@@ -1,4 +1,4 @@
-//! 3-D Rotary Position Embeddings for the LTX-2.5 video DiT.
+//! 3-D Rotary Position Embeddings for the LTX-2.5 video `DiT`.
 //!
 //! Two variants match the reference (`rope.py`):
 //! - **Split** ([`RopeType::Split`], default): each head's `d_head`-dimensional
@@ -12,7 +12,7 @@
 //! from `π/2` (at `i=0`) to `theta × π/2` (at `i=grid_size-1`).
 //!
 //! Positions arrive as `(B, n_pos_dims, T, 2)` with `use_middle_indices_grid=true`
-//! (the default); the last axis holds `[start, end)` index bounds and RoPE is
+//! (the default); the last axis holds `[start, end)` index bounds and `RoPE` is
 //! evaluated at the midpoint `(start + end) / 2`.
 
 use std::f64::consts::PI;
@@ -21,13 +21,13 @@ use burn::prelude::*;
 
 use crate::config::RopeType;
 
-/// Precompute RoPE cosine / sine tensors for one forward pass.
+/// Precompute `RoPE` cosine / sine tensors for one forward pass.
 ///
 /// # Arguments
 /// - `positions`: patch position bounds `(B, n_pos_dims, T, 2)` where the
 ///   last axis is `[start, end)`.  `n_pos_dims = 3` for video (t, h, w).
 /// - `inner_dim`: model's hidden dimension (`H × d_head`).
-/// - `theta`: RoPE base period (default 10 000).
+/// - `theta`: `RoPE` base period (default 10 000).
 /// - `max_pos`: maximum position in each dimension `[t_max, h_max, w_max]`.
 /// - `num_heads`: number of attention heads.
 /// - `rope_type`: `Split` or `Interleaved`.
@@ -39,6 +39,10 @@ use crate::config::RopeType;
 /// - **Split**: `(B, H, T, d_head/2)`
 /// - **Interleaved**: `(B, 1, T, inner_dim)` (head dim is 1 for broadcasting)
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "Burn tensor operators run on the compute backend; no integer overflow possible"
+)]
 pub fn precompute_freqs_cis<B: Backend>(
     positions: Tensor<B, 4>,
     inner_dim: usize,
@@ -117,9 +121,13 @@ pub fn precompute_freqs_cis<B: Backend>(
     }
 }
 
-/// Build `(cos, sin)` for the **Split** RoPE variant.
+/// Build `(cos, sin)` for the **Split** `RoPE` variant.
 ///
 /// Returns `(cos, sin)` each of shape `(B, H, T, d_head/2)`.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "Burn tensor operators run on the compute backend; no integer overflow possible"
+)]
 fn split_freqs_cis<B: Backend>(
     freqs: Tensor<B, 3>, // (B, T, grid_size*n_pos)
     inner_dim: usize,
@@ -158,7 +166,7 @@ fn split_freqs_cis<B: Backend>(
     (cos_4d, sin_4d)
 }
 
-/// Build `(cos, sin)` for the **Interleaved** RoPE variant (legacy).
+/// Build `(cos, sin)` for the **Interleaved** `RoPE` variant (legacy).
 ///
 /// Returns `(cos, sin)` each of shape `(B, 1, T, inner_dim)`.
 fn interleaved_freqs_cis<B: Backend>(
@@ -210,12 +218,16 @@ fn interleaved_freqs_cis<B: Backend>(
     )
 }
 
-/// Apply the **Split** RoPE rotation to query or key.
+/// Apply the **Split** `RoPE` rotation to query or key.
 ///
 /// - `x`: `(B, T, H × d_head)` — the raw Q or K before splitting into heads.
 /// - `cos` / `sin`: `(B, H, T, d_head/2)` from [`precompute_freqs_cis`].
 ///
 /// Returns the rotated tensor with the same shape as `x`.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "Burn tensor operators run on the compute backend; no integer overflow possible"
+)]
 pub fn apply_split_rope<B: Backend>(
     x: Tensor<B, 3>,
     cos: Tensor<B, 4>,
@@ -244,12 +256,16 @@ pub fn apply_split_rope<B: Backend>(
         .reshape([batch, n_tokens, inner])
 }
 
-/// Apply the **Interleaved** RoPE rotation to query or key (legacy).
+/// Apply the **Interleaved** `RoPE` rotation to query or key (legacy).
 ///
 /// - `x`: `(B, T, H × d_head)`.
 /// - `cos` / `sin`: `(B, 1, T, inner_dim)` from [`precompute_freqs_cis`].
 ///
 /// Returns the rotated tensor with the same shape as `x`.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "Burn tensor operators run on the compute backend; no integer overflow possible"
+)]
 pub fn apply_interleaved_rope<B: Backend>(
     x: Tensor<B, 3>,
     cos: Tensor<B, 4>,

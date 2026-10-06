@@ -1,4 +1,4 @@
-//! The LTX-2.5 22B video-only DiT (Diffusion Transformer).
+//! The LTX-2.5 22B video-only `DiT` (Diffusion Transformer).
 //!
 //! # Architecture
 //!
@@ -70,7 +70,7 @@ pub struct VideoInput<B: Backend> {
     /// Patch position bounds `(B, 3, T, 2)`.
     ///
     /// Axis 1 = `(t, h, w)` position dimensions; axis 3 = `[start, end)`.
-    /// When `use_middle_indices_grid = true` (default), RoPE uses the midpoint
+    /// When `use_middle_indices_grid = true` (default), `RoPE` uses the midpoint
     /// `(start + end) / 2`.
     pub positions: Tensor<B, 4>,
 
@@ -90,12 +90,12 @@ pub struct VideoInput<B: Backend> {
     pub self_attn_mask: Option<Tensor<B, 4>>,
 }
 
-/// The LTX-2.5 video-only DiT transformer.
+/// The LTX-2.5 video-only `DiT` transformer.
 #[derive(Module, Debug)]
 pub struct VideoTransformer<B: Backend> {
     /// Projects latent patches from `in_channels` to `inner_dim`.
     pub patchify_proj: Linear<B>,
-    /// Per-token timestep → AdaLN modulation + embedded timestep.
+    /// Per-token timestep → `AdaLN` modulation + embedded timestep.
     pub adaln_single: AdaLayerNormSingle<B>,
     /// Static output-norm scale-shift: `(2, inner_dim)`.
     pub scale_shift_table: Param<Tensor<B, 2>>,
@@ -162,6 +162,10 @@ impl<B: Backend> VideoTransformer<B> {
     ///
     /// Returns the predicted velocity (or x0, matching the reference output
     /// convention) of shape `(B, T, out_channels)`.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "Burn tensor operators run on the compute backend; no integer overflow possible"
+    )]
     pub fn forward(
         &self,
         input: VideoInput<B>,

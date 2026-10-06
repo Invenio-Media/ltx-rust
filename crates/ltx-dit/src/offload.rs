@@ -1,4 +1,4 @@
-//! Block-offloading strategy for the video DiT.
+//! Block-offloading strategy for the video `DiT`.
 //!
 //! The reference Python implementation (`OffloadMode`) can keep all N transformer
 //! blocks resident on the GPU or upload only N blocks at a time, releasing the
@@ -131,7 +131,7 @@ pub fn block_param_count(c: &DiTConfig) -> u64 {
 }
 
 /// Number of f32 parameters in the model's non-block components
-/// (patch embedding, AdaLN single, output norm and projection).
+/// (patch embedding, `AdaLN` single, output norm and projection).
 #[must_use]
 pub fn head_tail_param_count(c: &DiTConfig) -> u64 {
     let inner = u64_of(c.inner_dim());

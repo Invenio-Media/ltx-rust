@@ -3303,6 +3303,7 @@ name = "ltx-dit"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "ltx-weights",
  "safetensors 0.8.0",
  "serde",
  "serde_json",

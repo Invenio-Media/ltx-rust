@@ -1,14 +1,14 @@
 //! One LTX-2.5 transformer block (video stream only).
 //!
 //! Each block contains:
-//! 1. AdaLN-modulated RMS-norm → self-attention (with 3-D RoPE) → residual.
+//! 1. AdaLN-modulated RMS-norm → self-attention (with 3-D `RoPE`) → residual.
 //! 2. RMS-norm → text cross-attention → residual.
-//!    Optionally: AdaLN on the query side and a prompt-side AdaLN on K/V when
+//!    Optionally: `AdaLN` on the query side and a prompt-side `AdaLN` on K/V when
 //!    `cross_attention_adaln = true`; for the 22B model this is `false`.
 //! 3. AdaLN-modulated RMS-norm → feed-forward → residual.
 //!
 //! The learnable `scale_shift_table` holds the static per-block offset for the
-//! AdaLN modulation; the dynamic part is supplied by the timestep embedding.
+//! `AdaLN` modulation; the dynamic part is supplied by the timestep embedding.
 //!
 //! Reference: `BasicAVTransformerBlock.forward` (video branch only) in
 //! `transformer.py`.
@@ -30,13 +30,13 @@ pub struct TransformerBlock<B: Backend> {
     pub attn_cross: Attention<B>,
     /// Feed-forward network.
     pub ff: FeedForward<B>,
-    /// Static per-block AdaLN offset: `(adaln_coeff, inner_dim)`.
+    /// Static per-block `AdaLN` offset: `(adaln_coeff, inner_dim)`.
     /// `adaln_coeff` = 6 (base) or 9 (with `cross_attention_adaln`).
     pub scale_shift_table: Param<Tensor<B, 2>>,
     /// Static scale-shift for cross-attention Q modulation: `(2, inner_dim)`.
     /// Present only when `cross_attention_adaln = true`.
     pub prompt_scale_shift_table: Option<Param<Tensor<B, 2>>>,
-    /// Whether per-block cross-attention AdaLN is active.
+    /// Whether per-block cross-attention `AdaLN` is active.
     pub cross_attention_adaln: bool,
     /// Epsilon for RMS pre-norms.
     pub norm_eps: f32,
@@ -106,11 +106,15 @@ impl<B: Backend> TransformerBlock<B> {
     /// - `x`: hidden states `(B, T, inner_dim)`.
     /// - `context`: text context `(B, S, cross_attn_dim)`.
     /// - `context_mask`: additive log-space context mask `(B, 1, T, S)`.
-    /// - `timestep`: AdaLN modulation `(B, T_ts, adaln_coeff × inner_dim)`.
-    /// - `pe`: RoPE `(cos, sin)` for self-attention, each `(B, H, T, d/2)`.
+    /// - `timestep`: `AdaLN` modulation `(B, T_ts, adaln_coeff × inner_dim)`.
+    /// - `pe`: `RoPE` `(cos, sin)` for self-attention, each `(B, H, T, d/2)`.
     /// - `self_attn_mask`: optional self-attention bias `(B, 1, T, T)`.
     ///
     /// Returns updated `x` of the same shape.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "Burn tensor operators run on the compute backend; no integer overflow possible"
+    )]
     pub fn forward(
         &self,
         x: Tensor<B, 3>,
@@ -153,6 +157,10 @@ impl<B: Backend> TransformerBlock<B> {
     /// Extract `count` (shift, scale, gate) modulation tensors starting at `start`.
     ///
     /// Returns `(v0, v1, v2)` each of shape `(batch, t_ts, inner_dim)`.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "Burn tensor operators run on the compute backend; no integer overflow possible"
+    )]
     fn ada_values(
         &self,
         timestep: &Tensor<B, 3>, // (batch, t_ts, adaln_coeff * inner_dim)
@@ -189,11 +197,15 @@ impl<B: Backend> TransformerBlock<B> {
         (v0, v1, v2)
     }
 
-    /// Cross-attention with per-query AdaLN modulation.
+    /// Cross-attention with per-query `AdaLN` modulation.
     ///
     /// Used only when `cross_attention_adaln = true`.
     /// Slices 6..9 from `timestep` for the Q modulation;
     /// the prompt-side table modulates K/V.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "Burn tensor operators run on the compute backend; no integer overflow possible"
+    )]
     fn cross_attn_adaln(
         &self,
         x_normed: Tensor<B, 3>,

@@ -1,4 +1,4 @@
-//! LTX-2.5 22B video DiT in Burn (video stream only).
+//! LTX-2.5 22B video `DiT` in Burn (video stream only).
 //!
 //! # Usage
 //!
@@ -19,16 +19,10 @@
 //! | `metal`   | Apple Metal GPU backend |
 //! | `cuda`    | NVIDIA CUDA backend |
 
-// burn::Tensor<B, D> implements +/-/*/÷ on the compute backend; there is no
-// integer overflow risk.  clippy 0.1.98's `arithmetic-side-effects-allowed`
-// does not suppress the lint for generic user-defined types (the list only
-// works for known stdlib primitives like i32).  All scalar integer arithmetic
-// in this crate uses .saturating_add()/.saturating_mul() etc.  We suppress
-// the lint here so Tensor arithmetic compiles cleanly.
-#![allow(clippy::arithmetic_side_effects)]
-// Domain-specific acronyms (DiT, RoPE, AdaLN, IC-LoRA, K/V) appear throughout
-// the docs.  They are not Rust identifiers and should not be in backticks.
-#![allow(clippy::doc_markdown)]
+// All scalar integer arithmetic in this crate uses checked / saturating ops
+// so no integer overflow is possible.  Burn tensor arithmetic runs on the
+// compute backend and is allowed by the `arithmetic-side-effects-allowed`
+// setting in `clippy.toml`.
 
 pub mod adaln;
 pub mod attention;
@@ -36,6 +30,7 @@ pub mod block;
 pub mod config;
 pub mod error;
 pub mod feed_forward;
+pub mod load;
 pub mod model;
 pub mod norm;
 pub mod offload;

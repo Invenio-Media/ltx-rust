@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DitError;
 
-/// Which RoPE variant to use.
+/// Which `RoPE` variant to use.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RopeType {
@@ -27,9 +27,9 @@ pub enum RopeType {
 pub struct DiTFlags {
     /// Enable per-head sigmoid gating on attention output.
     pub apply_gated_attention: bool,
-    /// Use AdaLN for the cross-attention query/key/value projections.
+    /// Use `AdaLN` for the cross-attention query/key/value projections.
     pub cross_attention_adaln: bool,
-    /// Include a second AdaLN MLP for prompt conditioning when
+    /// Include a second `AdaLN` MLP for prompt conditioning when
     /// `cross_attention_adaln` is enabled; ignored otherwise.
     pub use_prompt_adaln_single: bool,
     /// Whether the feed-forward layers have a bias term.
@@ -42,7 +42,7 @@ pub struct DiTFlags {
     pub caption_proj_before_connector: bool,
 }
 
-/// Configuration for the LTX-2.5 video DiT transformer.
+/// Configuration for the LTX-2.5 video `DiT` transformer.
 ///
 /// Fields mirror `config["transformer"]` in the safetensors checkpoint metadata,
 /// as read by `LTXVideoOnlyModelConfigurator.from_metadata` in the reference.
@@ -75,7 +75,7 @@ pub struct DiTConfig {
     /// Epsilon for RMS norms and the output layer norm.
     #[serde(default = "default_norm_eps")]
     pub norm_eps: f32,
-    /// Base period for RoPE sinusoidal frequencies.
+    /// Base period for `RoPE` sinusoidal frequencies.
     #[serde(default = "default_rope_theta")]
     pub positional_embedding_theta: f64,
     /// Maximum position indices `[t_max, h_max, w_max]`.
@@ -84,10 +84,10 @@ pub struct DiTConfig {
     /// Timestep scaling factor applied before the sinusoidal embedding.
     #[serde(default = "default_ts_scale")]
     pub timestep_scale_multiplier: u32,
-    /// Use patch midpoint for RoPE instead of start index.
+    /// Use patch midpoint for `RoPE` instead of start index.
     #[serde(default = "bool_true")]
     pub use_middle_indices_grid: bool,
-    /// RoPE variant.
+    /// `RoPE` variant.
     #[serde(default)]
     pub rope_type: RopeType,
     /// Feature flag set.
@@ -158,7 +158,7 @@ impl DiTConfig {
             .saturating_mul(self.attention_head_dim)
     }
 
-    /// Number of AdaLN modulation scalars per block (6 base + 3 if `cross_attention_adaln`).
+    /// Number of `AdaLN` modulation scalars per block (6 base + 3 if `cross_attention_adaln`).
     #[must_use]
     pub const fn adaln_coeff(&self) -> usize {
         if self.flags.cross_attention_adaln {
