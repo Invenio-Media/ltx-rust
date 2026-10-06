@@ -88,7 +88,7 @@ fn build_na_mask<B: Backend>(
         }
     }
 
-    Tensor::<B, 2>::from_floats(data.as_slice(), device).reshape([n, n])
+    Tensor::<B, 1>::from_floats(data.as_slice(), device).reshape([n, n])
 }
 
 /// Eager 3-D neighbourhood attention.

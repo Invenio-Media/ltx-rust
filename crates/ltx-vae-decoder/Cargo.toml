@@ -15,14 +15,14 @@ cuda = ["burn/cuda"]
 [dependencies]
 burn = { workspace = true, features = ["ndarray"] }
 thiserror.workspace = true
-safetensors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-half.workspace = true
 ltx-shape = { path = "../ltx-shape" }
+ltx-weights = { path = "../ltx-weights" }
 
 [dev-dependencies]
 burn = { workspace = true, features = ["ndarray"] }
+safetensors.workspace = true
 
 [lints]
 workspace = true

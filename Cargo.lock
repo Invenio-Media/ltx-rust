@@ -3366,8 +3366,8 @@ name = "ltx-vae-decoder"
 version = "0.1.0"
 dependencies = [
  "burn",
- "half",
  "ltx-shape",
+ "ltx-weights",
  "safetensors 0.8.0",
  "serde",
  "serde_json",

@@ -44,9 +44,9 @@ pub enum VaeDecoderError {
         detail: String,
     },
 
-    /// safetensors I/O error.
-    #[error("safetensors error: {0}")]
-    SafeTensors(#[from] safetensors::SafeTensorError),
+    /// Weight loading error.
+    #[error("weight error: {0}")]
+    Weight(#[from] ltx_weights::WeightError),
 
     /// JSON config parse error.
     #[error("config JSON parse error: {0}")]
