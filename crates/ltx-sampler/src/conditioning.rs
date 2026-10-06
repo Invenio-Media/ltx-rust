@@ -140,7 +140,8 @@ impl<B: Backend> ImageKeyframeCondition<B> {
     ///
     /// # Errors
     /// [`SamplerError::Overflow`] for shape arithmetic overflows;
-    /// [`SamplerError::Shape`] for dimension mismatches.
+    /// [`SamplerError::Shape`] for dimension mismatches;
+    /// [`SamplerError::InvalidStrength`] when `strength` is outside `[0, 1]`.
     #[expect(
         clippy::arithmetic_side_effects,
         reason = "Burn tensor arithmetic is device math; it cannot overflow Rust integers"
@@ -150,6 +151,9 @@ impl<B: Backend> ImageKeyframeCondition<B> {
         mut state: LatentState<B>,
         device: &B::Device,
     ) -> Result<LatentState<B>, SamplerError> {
+        if !(0.0..=1.0).contains(&self.strength) {
+            return Err(SamplerError::InvalidStrength(self.strength));
+        }
         let [batch, _c, _f_one, height, width] = self.image_latent.dims();
 
         let expected = height.checked_mul(width).ok_or(SamplerError::Overflow)?;
@@ -190,6 +194,8 @@ impl<B: Backend> ImageKeyframeCondition<B> {
         let keep = Tensor::ones_like(&frame_mask) - frame_mask.clone();
 
         // clean_latent[span] = image tokens; denoise_mask[span] = 1 − strength.
+        // `keep` zeroes the old span values, so both assignments replace the span
+        // as the reference does, and leave every other token unchanged.
         state.clean_latent = state.clean_latent * keep.clone() + img_clean * frame_mask.clone();
         state.denoise_mask = state.denoise_mask * keep + frame_mask * (1.0 - self.strength);
 
@@ -289,6 +295,31 @@ mod tests {
                 (got - want).abs() < 1e-6,
                 "mask {mask:?} != {expected_mask:?}"
             );
+        }
+    }
+
+    #[test]
+    fn keyframe_condition_rejects_strength_outside_unit_range() {
+        let device = dev();
+        for strength in [-0.1_f32, 1.5, f32::NAN] {
+            let state = LatentState::<B> {
+                latent: Tensor::zeros([1, 2, 2], &device),
+                denoise_mask: Tensor::ones([1, 2, 1], &device),
+                positions: Tensor::zeros([1, 3, 2, 2], &device),
+                clean_latent: Tensor::zeros([1, 2, 2], &device),
+                attention_mask: None,
+                keyframes_mask: None,
+            };
+            let cond = ImageKeyframeCondition {
+                image_latent: Tensor::<B, 5>::zeros([1, 2, 1, 1, 2], &device),
+                latent_frame_index: 0,
+                tokens_per_frame: 2,
+                strength,
+            };
+            assert!(matches!(
+                cond.apply_to(state, &device),
+                Err(SamplerError::InvalidStrength(_))
+            ));
         }
     }
 }
