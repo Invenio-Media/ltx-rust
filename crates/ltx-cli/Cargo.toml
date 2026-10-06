@@ -11,10 +11,18 @@ description = "Command-line interface for the LTX alpha matte pipeline."
 name = "ltx"
 path = "src/main.rs"
 
+[features]
+default = []
+metal = ["ltx-burn/metal", "burn/metal"]
+cuda = ["ltx-burn/cuda", "burn/cuda"]
+
 [dependencies]
 anyhow.workspace = true
+burn.workspace = true
 clap = { workspace = true, features = ["env"] }
+half.workspace = true
 ltx-backend = { path = "../ltx-backend" }
+ltx-burn = { path = "../ltx-burn", default-features = false }
 ltx-pipeline = { path = "../ltx-pipeline" }
 
 [lints]

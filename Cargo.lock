@@ -3281,6 +3281,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ltx-burn"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "half",
+ "ltx-backend",
+ "ltx-dit",
+ "ltx-sampler",
+ "ltx-shape",
+ "ltx-vae",
+ "ltx-vae-decoder",
+ "ltx-weights",
+ "safetensors 0.8.0",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ltx-chunk"
 version = "0.1.0"
 dependencies = [
@@ -3293,8 +3311,11 @@ name = "ltx-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "burn",
  "clap",
+ "half",
  "ltx-backend",
+ "ltx-burn",
  "ltx-pipeline",
 ]
 

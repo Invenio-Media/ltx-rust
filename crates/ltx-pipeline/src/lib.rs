@@ -386,9 +386,17 @@ fn validate_alpha_chunk(
         || alpha.height != video.height
         || alpha.frame_count != video.frame_count
     {
-        return Err(PipelineError::InvalidAlphaChunk(
-            "metadata does not match input chunk".to_owned(),
-        ));
+        return Err(PipelineError::InvalidAlphaChunk(format!(
+            "backend returned start {} {}x{} x{} frames for input start {} {}x{} x{} frames",
+            alpha.start_frame,
+            alpha.width,
+            alpha.height,
+            alpha.frame_count,
+            video.start_frame,
+            video.width,
+            video.height,
+            video.frame_count
+        )));
     }
     let frames = usize::try_from(alpha.frame_count).map_err(|_| PipelineError::Overflow)?;
     let expected = frames

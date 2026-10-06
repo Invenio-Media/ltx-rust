@@ -533,7 +533,11 @@ impl WeightStore {
     /// (making `alpha/rank = 1`).  Deltas accumulate across calls.
     ///
     /// Key matching follows `_products_for_sd_key` / `_affected_weight_keys`
-    /// in `ltx_core/loader/fuse_loras.py`.
+    /// in `ltx_core/loader/fuse_loras.py`. `LoRA` keys are first renamed as
+    /// `LTXV_LORA_COMFY_RENAMING_MAP` does (`ltx_core/loader/sd_ops.py`), which
+    /// every reference pipeline applies to `--lora` files: each
+    /// `diffusion_model.` is removed, so `ComfyUI`-format `LoRA`s match the
+    /// transformer's state-dict names.
     ///
     /// # Errors
     ///
@@ -553,7 +557,7 @@ impl WeightStore {
             .map(|k| {
                 // `.strip_suffix` is always ASCII so the slice is char-safe.
                 let prefix = k.strip_suffix(lora_a_suffix).unwrap_or(k);
-                let base_key = format!("{prefix}.weight");
+                let base_key = format!("{}.weight", prefix.replace("diffusion_model.", ""));
                 let key_b = format!("{prefix}.lora_B.weight");
                 (base_key, k.to_owned(), key_b)
             })

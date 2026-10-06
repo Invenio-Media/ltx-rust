@@ -54,6 +54,13 @@ pub enum BackendError {
     /// An I/O error from the `ltx-io` crate.
     #[error("ltx-io: {0}")]
     LtxIo(#[from] ltx_io::IoError),
+
+    /// An operation is not supported by this backend.
+    ///
+    /// Used by `BurnBackend::probe`: Burn does not expose device-allocator
+    /// statistics, so peak-memory estimation is unavailable.
+    #[error("operation not supported: {0}")]
+    Unsupported(String),
 }
 
 /// A backend that generates alpha mattes from RGB video chunks.

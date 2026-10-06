@@ -23,23 +23,49 @@ alpha matte.
 | `ltx-vae` | Diffusion-video VAE encoder modules |
 | `ltx-dit` | LTX video transformer modules |
 | `ltx-vae-decoder` | Diffusion-video VAE decoder modules |
+| `ltx-burn` | Pure Burn backend: loads transformer, VAE, LoRA, prompt context; runs `euler_denoising_loop`; outputs alpha mattes |
 | `ltx-pipeline` | End-to-end chunk orchestration from video input to EXR matte output |
-| `ltx-cli` | `ltx` command: runs the pipeline through the Python reference backend |
+| `ltx-cli` | `ltx` command: `--transformer`, `--video-vae`, `--lora`, `--prompt-context` |
 
 ## Usage
 
+### Prompt context (run once per prompt)
+
+```sh
+python -W ignore tools/prompt_context.py \
+  --transformer ltx-2.5-transformer.safetensors \
+  --text-encoder /path/to/gemma \
+  --prompt "generate alpha matte" \
+  --out prompt_context.safetensors
+```
+
+### Inference (CPU / NdArray)
+
 ```sh
 cargo run --release -p ltx-cli -- input.mp4 out_mattes \
-  --python /path/to/LTX-2/.venv/bin/python \
   --transformer ltx-2.5-transformer.safetensors \
   --video-vae ltx-2.5-video-vae.safetensors \
   --lora alpha-gen-ic-lora.safetensors:1.0 \
   --prompt-context prompt_context.safetensors
 ```
 
-`--chunk-len` (8k+1) and `--overlap` (multiple of 8) set the temporal chunking.
-Run `ltx --help` for all options.
+### Inference (Apple Metal, f32)
 
+Burn 0.21 on Metal cannot run bf16 matmul, so the `metal` feature computes in
+f32. The video transformer's f32 weights must fit in the GPU working set
+(about 107 GB on a 128 GB M4 Max).
+
+```sh
+cargo run --release -p ltx-cli --features metal -- input.mp4 out_mattes \
+  --transformer ltx-2.5-transformer.safetensors \
+  --video-vae ltx-2.5-video-vae.safetensors \
+  --lora alpha-gen-ic-lora.safetensors:1.0 \
+  --prompt-context prompt_context.safetensors
+```
+
+`--chunk-len` (8k+1), `--overlap` (multiple of 8), `--num-inference-steps`,
+`--cfg-scale`, and `--frame-rate` are the key tuning flags.
+Run `ltx --help` for all options.
 ## Checks
 
 ```sh

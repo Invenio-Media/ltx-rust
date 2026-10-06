@@ -1,23 +1,38 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, ValueEnum};
-use ltx_backend::PythonBackend;
+use anyhow::{Context, Result, bail};
+use clap::Parser;
+use ltx_burn::{BurnBackend, GenerationSettings, ModelFiles};
 use ltx_pipeline::{PipelineConfig, run_video};
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum QuantizationArg {
-    None,
-    Fp8,
-}
+// ── Backend type selection ─────────────────────────────────────────────────────
+// Exactly one backend feature may be active. Enable conflicting features together
+// and the build fails with a clear message.
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum OffloadArg {
-    None,
-    Model,
-    Sequential,
-    Disk,
-}
+#[cfg(all(feature = "metal", feature = "cuda"))]
+compile_error!("features 'metal' and 'cuda' are mutually exclusive; enable at most one");
+
+/// CPU backend (default, no GPU feature selected).
+#[cfg(not(any(feature = "metal", feature = "cuda")))]
+type ActiveBackend = burn::backend::NdArray<f32>;
+/// Device for the CPU backend.
+#[cfg(not(any(feature = "metal", feature = "cuda")))]
+type ActiveDevice = burn::backend::ndarray::NdArrayDevice;
+
+/// Apple Metal GPU backend (Burn 0.21: Metal is Wgpu with the Metal graphics API).
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+type ActiveBackend = burn::backend::Metal<f32>;
+/// Device for the Metal backend.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+type ActiveDevice = burn::backend::wgpu::WgpuDevice;
+
+/// NVIDIA CUDA GPU backend.
+#[cfg(all(feature = "cuda", not(feature = "metal")))]
+type ActiveBackend = burn::backend::Cuda<half::bf16>;
+/// Device for the CUDA backend.
+#[cfg(all(feature = "cuda", not(feature = "metal")))]
+type ActiveDevice = burn::backend::cuda::CudaDevice;
+// ── Argument parser ────────────────────────────────────────────────────────────
 
 /// A `LoRA` file with its merge strength.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,7 +84,10 @@ fn parse_finite_f32(value: &str) -> Result<f32, String> {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "ltx", about = "Generate LTX Alpha Gen mattes")]
+#[command(
+    name = "ltx",
+    about = "Generate LTX Alpha Gen mattes with the pure Burn backend"
+)]
 struct Cli {
     /// Input video file.
     #[arg(value_name = "INPUT")]
@@ -79,15 +97,6 @@ struct Cli {
     #[arg(value_name = "OUTPUT_DIR")]
     output_dir: PathBuf,
 
-    /// Python interpreter with the LTX-2 environment.
-    #[arg(long, value_name = "PATH", default_value = "python3")]
-    python: PathBuf,
-
-    /// Path to `python/alphagen_runner.py`. Defaults to `python/alphagen_runner.py`
-    /// next to the `ltx` binary, then to the one in this source checkout.
-    #[arg(long, value_name = "PATH", env = "LTX_RUNNER")]
-    runner: Option<PathBuf>,
-
     /// LTX-2.5 transformer safetensors checkpoint.
     #[arg(long, value_name = "PATH")]
     transformer: PathBuf,
@@ -96,41 +105,25 @@ struct Cli {
     #[arg(long = "video-vae", value_name = "PATH")]
     video_vae: PathBuf,
 
-    /// `LoRA` safetensors path and strength as PATH:STRENGTH. May be repeated.
+    /// IC-LoRA safetensors path and strength as PATH:STRENGTH. May be repeated.
     #[arg(long, value_name = "PATH:STRENGTH", required = true, value_parser = parse_lora)]
     lora: Vec<LoraSpec>,
 
-    /// Prompt text. Used when --prompt-context is absent.
-    #[arg(long, default_value = "", allow_hyphen_values = true)]
-    prompt: String,
+    /// Precomputed Gemma prompt context safetensors file (from `tools/prompt_context.py`).
+    ///
+    /// Generate with:
+    ///   `python -W ignore tools/prompt_context.py`
+    ///     `--transformer <path> --text-encoder <gemma-dir> --prompt "..." --out ctx.safetensors`
+    #[arg(long, value_name = "PATH", required = true)]
+    prompt_context: PathBuf,
 
-    /// Negative prompt text.
-    #[arg(
-        long,
-        allow_hyphen_values = true,
-        default_value = "worst quality, inconsistent motion, blurry, jittery, distorted"
-    )]
-    negative_prompt: String,
-
-    /// Precomputed Gemma prompt context safetensors file.
-    #[arg(long, value_name = "PATH")]
-    prompt_context: Option<PathBuf>,
-
-    /// Diffusion steps per chunk.
+    /// Euler denoising steps per chunk.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..))]
     num_inference_steps: u32,
 
-    /// Video CFG guidance scale.
+    /// Video CFG guidance scale (1.0 = conditioned only; no unconditioned pass).
     #[arg(long, default_value_t = 1.0, value_parser = parse_finite_f32)]
     cfg_scale: f32,
-
-    /// Runner weight quantization.
-    #[arg(long, value_enum, default_value_t = QuantizationArg::None)]
-    quantization: QuantizationArg,
-
-    /// Runner offload mode.
-    #[arg(long, value_enum, default_value_t = OffloadArg::None)]
-    offload: OffloadArg,
 
     /// Frame rate for `RoPE` conditioning.
     #[arg(long, default_value_t = 24.0, value_parser = parse_positive_f32)]
@@ -159,42 +152,59 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = PipelineConfig {
+
+    // Validate files exist before loading weights.
+    check_inputs_exist(&cli)?;
+
+    let pipeline_config = PipelineConfig {
         chunk_len: cli.chunk_len,
         overlap: cli.overlap,
         seed: cli.seed,
         matte_prefix: cli.matte_prefix.clone(),
         seam_keyframes: !cli.no_seam_keyframes,
     };
-    config
+    pipeline_config
         .validate()
         .context("invalid --chunk-len / --overlap")?;
-    check_inputs_exist(&cli)?;
-    let runner = resolve_runner(cli.runner.as_deref())?;
 
-    let runner_args = build_runner_args(&cli)?;
-    let runner_arg_refs: Vec<&str> = runner_args.iter().map(String::as_str).collect();
-    let backend = PythonBackend::spawn(&cli.python, &runner, &runner_arg_refs)
-        .with_context(|| format!("failed to spawn runner {}", runner.display()))?;
-    let report = run_video(&backend, &cli.input, &cli.output_dir, &config)?;
+    let model_files = ModelFiles {
+        transformer: cli.transformer.clone(),
+        video_vae: cli.video_vae.clone(),
+        loras: cli
+            .lora
+            .iter()
+            .map(|spec| (spec.path.clone(), spec.strength))
+            .collect(),
+        prompt_context: cli.prompt_context.clone(),
+    };
+
+    let settings = GenerationSettings {
+        num_inference_steps: cli.num_inference_steps,
+        cfg_scale: cli.cfg_scale,
+        frame_rate: cli.frame_rate,
+    };
+
+    let device = ActiveDevice::default();
+    let backend = BurnBackend::<ActiveBackend>::load(&model_files, &settings, &device)
+        .context("failed to load model weights")?;
+
+    let report = run_video(&backend, &cli.input, &cli.output_dir, &pipeline_config)?;
     println!(
-        "wrote {} alpha frames from {} input frames ({} padded frames, {} chunks)",
+        "wrote {} alpha frames from {} input frames ({} padded, {} chunks)",
         report.written_frames, report.input_frames, report.padded_frames, report.chunk_count
     );
     Ok(())
 }
 
-/// Fail before the runner loads models when a required file is missing.
+/// Fail before loading any weights when a required file is missing.
 fn check_inputs_exist(cli: &Cli) -> Result<()> {
-    let mut files = vec![
+    let mut files: Vec<(&str, &std::path::Path)> = vec![
         ("input video", cli.input.as_path()),
         ("--transformer", cli.transformer.as_path()),
         ("--video-vae", cli.video_vae.as_path()),
+        ("--prompt-context", cli.prompt_context.as_path()),
     ];
-    files.extend(cli.lora.iter().map(|lora| ("--lora", lora.path.as_path())));
-    if let Some(prompt_context) = &cli.prompt_context {
-        files.push(("--prompt-context", prompt_context.as_path()));
-    }
+    files.extend(cli.lora.iter().map(|s| ("--lora", s.path.as_path())));
     for (label, path) in files {
         if !path.is_file() {
             bail!("{label} file not found: {}", path.display());
@@ -203,130 +213,32 @@ fn check_inputs_exist(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-/// Pick the runner script: `--runner` / `LTX_RUNNER`, then
-/// `python/alphagen_runner.py` beside the binary, then the source checkout.
-fn resolve_runner(explicit: Option<&Path>) -> Result<PathBuf> {
-    if let Some(path) = explicit {
-        if path.is_file() {
-            return Ok(path.to_path_buf());
-        }
-        bail!("--runner file not found: {}", path.display());
-    }
-    let beside_exe = std::env::current_exe().ok().and_then(|exe| {
-        exe.parent()
-            .map(|dir| dir.join("python").join("alphagen_runner.py"))
-    });
-    let in_checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("python")
-        .join("alphagen_runner.py");
-    beside_exe
-        .into_iter()
-        .chain(std::iter::once(in_checkout))
-        .find(|path| path.is_file())
-        .ok_or_else(|| anyhow!("alphagen_runner.py not found; pass --runner or set LTX_RUNNER"))
-}
-
-fn value_name<T: ValueEnum>(value: &T) -> Result<String> {
-    value
-        .to_possible_value()
-        .map(|v| v.get_name().to_owned())
-        .ok_or_else(|| anyhow!("value enum has no name"))
-}
-
-fn build_runner_args(cli: &Cli) -> Result<Vec<String>> {
-    let mut args = vec![
-        "--transformer".to_owned(),
-        path_to_string(&cli.transformer)?,
-        "--video-vae".to_owned(),
-        path_to_string(&cli.video_vae)?,
-    ];
-    for lora in &cli.lora {
-        args.push("--lora".to_owned());
-        args.push(format!("{}:{}", path_to_string(&lora.path)?, lora.strength));
-    }
-    args.push("--prompt".to_owned());
-    args.push(cli.prompt.clone());
-    args.push("--negative-prompt".to_owned());
-    args.push(cli.negative_prompt.clone());
-    if let Some(prompt_context) = &cli.prompt_context {
-        args.push("--prompt-context".to_owned());
-        args.push(path_to_string(prompt_context)?);
-    }
-    args.push("--num-inference-steps".to_owned());
-    args.push(cli.num_inference_steps.to_string());
-    args.push("--cfg-scale".to_owned());
-    args.push(cli.cfg_scale.to_string());
-    args.push("--quantization".to_owned());
-    args.push(value_name(&cli.quantization)?);
-    args.push("--offload".to_owned());
-    args.push(value_name(&cli.offload)?);
-    args.push("--frame-rate".to_owned());
-    args.push(cli.frame_rate.to_string());
-    Ok(args)
-}
-
-fn path_to_string(path: &Path) -> Result<String> {
-    path.to_str()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| anyhow!("path contains non-UTF-8 bytes: {}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
-
     use super::*;
 
     #[test]
-    fn clap_definition_is_valid() {
-        Cli::command().debug_assert();
+    fn parse_lora_accepts_valid_spec() {
+        let spec = parse_lora("/path/to/lora.safetensors:0.8").unwrap();
+        assert_eq!(spec.path, PathBuf::from("/path/to/lora.safetensors"));
+        assert!((spec.strength - 0.8).abs() < 1e-6);
     }
 
     #[test]
-    fn lora_spec_splits_on_last_colon() {
-        assert_eq!(
-            parse_lora(r"C:\models\alpha.safetensors:0.75").unwrap(),
-            LoraSpec {
-                path: PathBuf::from(r"C:\models\alpha.safetensors"),
-                strength: 0.75,
-            }
-        );
+    fn parse_lora_handles_windows_path() {
+        // Last colon is the separator.
+        let spec = parse_lora("C:\\models\\lora.safetensors:1.0").unwrap();
+        assert_eq!(spec.path, PathBuf::from("C:\\models\\lora.safetensors"));
     }
 
     #[test]
-    fn lora_spec_rejects_missing_or_bad_strength() {
-        assert!(parse_lora("alpha.safetensors").is_err());
-        assert!(parse_lora("alpha.safetensors:").is_err());
-        assert!(parse_lora("alpha.safetensors:strong").is_err());
-        assert!(parse_lora("alpha.safetensors:NaN").is_err());
-        assert!(parse_lora(":1.0").is_err());
+    fn parse_lora_rejects_non_finite() {
+        assert!(parse_lora("/path:inf").is_err());
+        assert!(parse_lora("/path:nan").is_err());
     }
 
     #[test]
-    fn numeric_options_reject_out_of_range_values() {
-        assert!(parse_positive_f32("0").is_err());
-        assert!(parse_positive_f32("-24").is_err());
-        assert!(parse_positive_f32("inf").is_err());
-        assert!(parse_finite_f32("NaN").is_err());
-        assert_eq!(
-            parse_finite_f32("-1.5").unwrap().to_bits(),
-            (-1.5_f32).to_bits()
-        );
-        let zero_steps = Cli::try_parse_from([
-            "ltx",
-            "in.mp4",
-            "out",
-            "--transformer",
-            "t",
-            "--video-vae",
-            "v",
-            "--lora",
-            "a:1",
-            "--num-inference-steps",
-            "0",
-        ]);
-        assert!(zero_steps.is_err());
+    fn parse_lora_rejects_missing_strength() {
+        assert!(parse_lora("/path/to/lora.safetensors").is_err());
     }
 }

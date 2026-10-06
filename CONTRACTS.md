@@ -71,3 +71,19 @@ Until `feat/ltx-weights` merges, consumers can `git fetch origin feat/ltx-weight
   `FnMut(PixelShape) -> Result<u64 /* peak bytes */, E>`.
 - ltx-chunk is pure index and pixel math over `f32` frame planes; no I/O, no Burn.
 - ltx-backend defines `AlphaBackend` and the Python backend. It may depend on ltx-shape, ltx-io.
+
+## Prompt context file (`tools/prompt_context.py`) — consumed by the Burn backend
+Gemma is not ported. `tools/prompt_context.py` runs the reference `PromptEncoder` once and saves
+its `EmbeddingsProcessorOutput` (after the connector, whose weights live in the transformer
+checkpoint). The backend loads it with `WeightStore::open(&[path], &KeyMap::identity())`.
+
+| Key | Shape | Dtype | Meaning |
+| --- | --- | --- | --- |
+| `positive.video_encoding` | `[1, S, D]` | bf16 | DiT cross-attention context for the prompt |
+| `positive.attention_mask` | `[1, S]` | f32 | 1.0 valid token, 0.0 padding |
+| `negative.video_encoding` | `[1, S, D]` | bf16 | context for the negative prompt (used only when CFG ≠ 1) |
+| `negative.attention_mask` | `[1, S]` | f32 | as above |
+
+Metadata: `format = "ltx-prompt-context/1"`, `prompt`, `negative_prompt`, `transformer`,
+`text_encoder`, `ltx2_commit`. The file is valid only with the transformer checkpoint it was made
+from, because the connector weights come from that checkpoint.
