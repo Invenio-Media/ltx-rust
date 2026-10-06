@@ -46,7 +46,11 @@ pub fn load_tensor<B: Backend, const D: usize>(
     Ok(t)
 }
 
-fn check_dims<const D: usize>(key: &str, expected: &[usize], got: &[usize; D]) -> Result<(), VaeError> {
+fn check_dims<const D: usize>(
+    key: &str,
+    expected: &[usize],
+    got: &[usize; D],
+) -> Result<(), VaeError> {
     if got.as_slice() == expected {
         Ok(())
     } else {
