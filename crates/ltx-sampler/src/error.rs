@@ -48,4 +48,8 @@ pub enum SamplerError {
     /// A u32→f32 conversion could not be represented exactly (value out of f32 range).
     #[error("value {0} cannot be converted to f32")]
     FloatConversion(u64),
+
+    /// A conditioning strength is outside `[0, 1]` (or not a number).
+    #[error("conditioning strength {0} must be in [0, 1]")]
+    InvalidStrength(f32),
 }
