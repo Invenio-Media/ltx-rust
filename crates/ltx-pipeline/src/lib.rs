@@ -76,14 +76,18 @@ pub enum PipelineError {
     #[error("dimension overflow")]
     Overflow,
     /// Backend input chunk validation failed.
-    #[error("invalid video chunk")]
-    InvalidVideoChunk,
+    #[error("invalid video chunk: {0}")]
+    InvalidVideoChunk(String),
     /// Backend output has wrong dimensions or length.
     #[error("invalid alpha chunk: {0}")]
     InvalidAlphaChunk(String),
     /// Blending did not emit all real frames.
-    #[error("pipeline emitted {emitted} frames but expected {expected}")]
-    OutputFrameCount { emitted: u32, expected: u32 },
+    #[error("pipeline wrote {written} frames, emitted {emitted}, expected {expected}")]
+    OutputFrameCount {
+        written: u32,
+        emitted: u32,
+        expected: u32,
+    },
 }
 
 /// Run the alpha pipeline and write one EXR per real input frame.
@@ -98,6 +102,9 @@ pub fn run_video<B: AlphaBackend>(
     config: &PipelineConfig,
 ) -> Result<PipelineReport, PipelineError> {
     let metadata = ltx_io::probe(input)?;
+    if metadata.frame_count == 0 {
+        return Err(PipelineError::EmptyInput);
+    }
     let writer = MatteWriter::new(output_dir.to_path_buf(), config.matte_prefix.clone())?;
     let mut source = FfmpegSource { input, metadata };
     run_with_source(
@@ -150,15 +157,6 @@ impl ChunkSource for FfmpegSource<'_> {
             .ok_or(PipelineError::EmptyInput)?;
         let end = last.checked_add(1).ok_or(PipelineError::Overflow)?;
 
-        let frames = FrameStream::open_with_size(
-            self.input,
-            first,
-            end,
-            self.metadata.width,
-            self.metadata.height,
-        )?
-        .collect_frames()?;
-
         let frame_values = frame_pixels(self.metadata.width, self.metadata.height)?
             .checked_mul(3)
             .ok_or(PipelineError::Overflow)?;
@@ -169,18 +167,19 @@ impl ChunkSource for FfmpegSource<'_> {
                 .ok_or(PipelineError::Overflow)?,
         );
 
-        for source_idx in source_indices {
-            let rel = source_idx
-                .checked_sub(first)
-                .ok_or(PipelineError::Overflow)?;
-            let rel_usize = usize::try_from(rel).map_err(|_| PipelineError::Overflow)?;
-            let frame = frames
-                .get(rel_usize)
-                .ok_or(PipelineError::InvalidVideoChunk)?;
-            if frame.index != source_idx {
-                return Err(PipelineError::InvalidVideoChunk);
-            }
-            data.extend_from_slice(&frame.data);
+        let mut stream = FrameStream::open_with_size(
+            self.input,
+            first,
+            end,
+            self.metadata.width,
+            self.metadata.height,
+        )?;
+
+        if source_indices_are_contiguous(&source_indices, first) {
+            append_contiguous_stream(&mut stream, chunk.len(), &mut data)?;
+        } else {
+            let frames = stream.collect_frames()?;
+            append_mapped_frames(&frames, &source_indices, first, &mut data)?;
         }
 
         VideoChunk::new(
@@ -190,8 +189,69 @@ impl ChunkSource for FfmpegSource<'_> {
             chunk.len(),
             data,
         )
-        .ok_or(PipelineError::InvalidVideoChunk)
+        .ok_or_else(|| PipelineError::InvalidVideoChunk("VideoChunk::new rejected data".to_owned()))
     }
+}
+
+#[derive(Debug, Clone)]
+struct PreviousAlphaTail {
+    width: u32,
+    height: u32,
+    data: Vec<f32>,
+    frame_count: u32,
+}
+
+fn source_indices_are_contiguous(indices: &[u32], first: u32) -> bool {
+    indices.iter().copied().enumerate().all(|(offset, value)| {
+        u32::try_from(offset)
+            .ok()
+            .and_then(|offset_u32| first.checked_add(offset_u32))
+            == Some(value)
+    })
+}
+
+fn append_contiguous_stream(
+    stream: &mut FrameStream,
+    expected_frames: u32,
+    data: &mut Vec<f32>,
+) -> Result<(), PipelineError> {
+    let mut read_frames = 0_u32;
+    while let Some(frame) = stream.next_frame() {
+        let frame = frame?;
+        data.extend_from_slice(&frame.data);
+        read_frames = read_frames.saturating_add(1);
+    }
+    if read_frames != expected_frames {
+        return Err(PipelineError::InvalidVideoChunk(format!(
+            "ffmpeg returned {read_frames} frames, expected {expected_frames}"
+        )));
+    }
+    Ok(())
+}
+
+fn append_mapped_frames(
+    frames: &[ltx_io::RgbF32Frame],
+    source_indices: &[u32],
+    first: u32,
+    data: &mut Vec<f32>,
+) -> Result<(), PipelineError> {
+    for source_idx in source_indices {
+        let rel = source_idx
+            .checked_sub(first)
+            .ok_or(PipelineError::Overflow)?;
+        let rel_usize = usize::try_from(rel).map_err(|_| PipelineError::Overflow)?;
+        let frame = frames.get(rel_usize).ok_or_else(|| {
+            PipelineError::InvalidVideoChunk(format!("source frame {source_idx} missing"))
+        })?;
+        if frame.index != *source_idx {
+            return Err(PipelineError::InvalidVideoChunk(format!(
+                "source frame {} decoded as {}",
+                source_idx, frame.index
+            )));
+        }
+        data.extend_from_slice(&frame.data);
+    }
+    Ok(())
 }
 
 fn run_with_source<B, S, W>(
@@ -212,7 +272,7 @@ where
 
     let pad = pad_to_grid(input_frames, ScaleFactors::LTX2).ok_or(PipelineError::PadOverflow)?;
     let chunks = plan(pad.padded_len, config.chunk_len, config.overlap)?;
-    let frame_count = u32::try_from(chunks.len()).map_err(|_| PipelineError::Overflow)?;
+    let chunk_count = u32::try_from(chunks.len()).map_err(|_| PipelineError::Overflow)?;
     let frame_pixels_u32 = source
         .width()
         .checked_mul(source.height())
@@ -222,12 +282,12 @@ where
 
     let mut emitted = 0_u32;
     let mut written = 0_u32;
-    let mut previous_alpha: Option<AlphaChunk> = None;
+    let mut previous_tail: Option<PreviousAlphaTail> = None;
 
     for (chunk_idx, chunk) in chunks.iter().copied().enumerate() {
         let video = source.read_chunk(chunk, pad)?;
         let cond = if config.seam_keyframes {
-            match previous_alpha.as_ref() {
+            match previous_tail.as_ref() {
                 Some(prev) => keyframes_from_previous(prev, chunk.real_overlap)?,
                 None => None,
             }
@@ -235,9 +295,9 @@ where
             None
         };
         let seed = seed_for_chunk(config.seed, chunk_idx)?;
-        let alpha = backend.run_chunk(&video, seed, cond.as_ref())?;
+        let mut alpha = backend.run_chunk(&video, seed, cond.as_ref())?;
         validate_alpha_chunk(&alpha, &video, frame_values)?;
-
+        sanitize_alpha_chunk(&mut alpha)?;
         push_alpha_to_blender(&mut blender, &alpha, frame_values)?;
         let next_overlap = chunks
             .get(chunk_idx.saturating_add(1))
@@ -252,7 +312,7 @@ where
             source.height(),
             &mut write_frame,
         )?;
-        previous_alpha = Some(alpha);
+        previous_tail = alpha_tail_for_next(&alpha, next_overlap, frame_values)?;
     }
 
     for frame in blender.flush() {
@@ -265,7 +325,8 @@ where
 
     if written != input_frames {
         return Err(PipelineError::OutputFrameCount {
-            emitted: written,
+            written,
+            emitted,
             expected: input_frames,
         });
     }
@@ -273,7 +334,7 @@ where
     Ok(PipelineReport {
         input_frames,
         padded_frames: pad.padded_len,
-        chunk_count: frame_count,
+        chunk_count,
         written_frames: written,
     })
 }
@@ -329,23 +390,31 @@ fn validate_alpha_chunk(
     Ok(())
 }
 
+fn sanitize_alpha_chunk(alpha: &mut AlphaChunk) -> Result<(), PipelineError> {
+    for value in &mut alpha.data {
+        if !value.is_finite() {
+            return Err(PipelineError::InvalidAlphaChunk(
+                "alpha contains NaN or Inf".to_owned(),
+            ));
+        }
+        *value = value.clamp(0.0_f32, 1.0_f32);
+    }
+    Ok(())
+}
+
 fn push_alpha_to_blender(
     blender: &mut Blender,
     alpha: &AlphaChunk,
     frame_values: usize,
 ) -> Result<(), PipelineError> {
     for frame_idx in 0..alpha.frame_count {
-        let start = usize::try_from(frame_idx)
-            .map_err(|_| PipelineError::Overflow)?
-            .checked_mul(frame_values)
-            .ok_or(PipelineError::Overflow)?;
-        let end = start
-            .checked_add(frame_values)
-            .ok_or(PipelineError::Overflow)?;
-        let frame = alpha
-            .data
-            .get(start..end)
-            .ok_or_else(|| PipelineError::InvalidAlphaChunk("frame slice missing".to_owned()))?;
+        let frame = frame_slice(
+            &alpha.data,
+            frame_idx,
+            alpha.frame_count,
+            frame_values,
+            "frame slice missing",
+        )?;
         blender.push_frame(frame)?;
     }
     Ok(())
@@ -373,12 +442,52 @@ where
     Ok(())
 }
 
+fn alpha_tail_for_next(
+    alpha: &AlphaChunk,
+    next_overlap: u32,
+    frame_values: usize,
+) -> Result<Option<PreviousAlphaTail>, PipelineError> {
+    if next_overlap == 0 {
+        return Ok(None);
+    }
+    if next_overlap > alpha.frame_count {
+        return Err(PipelineError::InvalidAlphaChunk(
+            "next overlap exceeds alpha chunk length".to_owned(),
+        ));
+    }
+    let start_frame = alpha.frame_count.saturating_sub(next_overlap);
+    let start = usize::try_from(start_frame)
+        .map_err(|_| PipelineError::Overflow)?
+        .checked_mul(frame_values)
+        .ok_or(PipelineError::Overflow)?;
+    let end = usize::try_from(alpha.frame_count)
+        .map_err(|_| PipelineError::Overflow)?
+        .checked_mul(frame_values)
+        .ok_or(PipelineError::Overflow)?;
+    let data = alpha
+        .data
+        .get(start..end)
+        .ok_or_else(|| PipelineError::InvalidAlphaChunk("tail slice missing".to_owned()))?
+        .to_vec();
+    Ok(Some(PreviousAlphaTail {
+        width: alpha.width,
+        height: alpha.height,
+        data,
+        frame_count: next_overlap,
+    }))
+}
+
 fn keyframes_from_previous(
-    previous: &AlphaChunk,
+    previous: &PreviousAlphaTail,
     overlap: u32,
 ) -> Result<Option<Keyframes>, PipelineError> {
     if overlap == 0 {
         return Ok(None);
+    }
+    if overlap > previous.frame_count {
+        return Err(PipelineError::InvalidAlphaChunk(
+            "requested overlap exceeds saved previous tail".to_owned(),
+        ));
     }
 
     let plan = seam_cond_plan(overlap)?;
@@ -391,18 +500,27 @@ fn keyframes_from_previous(
             .ok_or(PipelineError::Overflow)?,
     );
     let mut indices = Vec::with_capacity(cond_count);
-    let mut strength = None;
+    let mut strength: Option<f32> = None;
 
     for cond_frame in plan.conditioning_frames {
-        let previous_idx = previous
-            .frame_count
-            .checked_sub(overlap)
-            .and_then(|idx| idx.checked_add(cond_frame.chunk_local_idx))
-            .ok_or(PipelineError::Overflow)?;
-        let alpha = alpha_frame(previous, previous_idx, frame_values)?;
+        let alpha = frame_slice(
+            &previous.data,
+            cond_frame.chunk_local_idx,
+            previous.frame_count,
+            frame_values,
+            "keyframe slice missing",
+        )?;
         append_gray_rgb(alpha, &mut frames);
         indices.push(cond_frame.chunk_local_idx);
-        strength = Some(cond_frame.strength);
+        match strength {
+            Some(prev) if prev.to_bits() != cond_frame.strength.to_bits() => {
+                return Err(PipelineError::InvalidAlphaChunk(
+                    "seam plan returned mixed keyframe strengths".to_owned(),
+                ));
+            }
+            Some(_) => {}
+            None => strength = Some(cond_frame.strength),
+        }
     }
 
     let frame_count = u32::try_from(indices.len()).map_err(|_| PipelineError::Overflow)?;
@@ -416,15 +534,17 @@ fn keyframes_from_previous(
     }))
 }
 
-fn alpha_frame(
-    alpha: &AlphaChunk,
+fn frame_slice<'a>(
+    data: &'a [f32],
     frame_idx: u32,
+    frame_count: u32,
     frame_values: usize,
-) -> Result<&[f32], PipelineError> {
-    if frame_idx >= alpha.frame_count {
-        return Err(PipelineError::InvalidAlphaChunk(
-            "keyframe index outside previous chunk".to_owned(),
-        ));
+    missing: &str,
+) -> Result<&'a [f32], PipelineError> {
+    if frame_idx >= frame_count {
+        return Err(PipelineError::InvalidAlphaChunk(format!(
+            "frame index {frame_idx} outside frame count {frame_count}"
+        )));
     }
     let start = usize::try_from(frame_idx)
         .map_err(|_| PipelineError::Overflow)?
@@ -433,10 +553,8 @@ fn alpha_frame(
     let end = start
         .checked_add(frame_values)
         .ok_or(PipelineError::Overflow)?;
-    alpha
-        .data
-        .get(start..end)
-        .ok_or_else(|| PipelineError::InvalidAlphaChunk("keyframe slice missing".to_owned()))
+    data.get(start..end)
+        .ok_or_else(|| PipelineError::InvalidAlphaChunk(missing.to_owned()))
 }
 
 fn append_gray_rgb(alpha: &[f32], out: &mut Vec<f32>) {
@@ -505,8 +623,9 @@ mod tests {
                 let src_usize = usize::try_from(src).unwrap();
                 frames.extend_from_slice(self.frames.get(src_usize).unwrap());
             }
-            VideoChunk::new(chunk.start, self.width, self.height, chunk.len(), frames)
-                .ok_or(PipelineError::InvalidVideoChunk)
+            VideoChunk::new(chunk.start, self.width, self.height, chunk.len(), frames).ok_or_else(
+                || PipelineError::InvalidVideoChunk("memory source built bad chunk".to_owned()),
+            )
         }
     }
 
@@ -514,6 +633,7 @@ mod tests {
     struct RecordingBackend {
         keyframe_counts: RefCell<Vec<u32>>,
         seeds: RefCell<Vec<u64>>,
+        keyframes: RefCell<Vec<Option<Keyframes>>>,
     }
 
     impl AlphaBackend for RecordingBackend {
@@ -531,6 +651,7 @@ mod tests {
             self.keyframe_counts
                 .borrow_mut()
                 .push(cond.map_or(0, |kf| kf.frame_count));
+            self.keyframes.borrow_mut().push(cond.cloned());
 
             let pixels = usize::try_from(rgb.width)
                 .unwrap()
@@ -601,6 +722,24 @@ mod tests {
 
         assert_eq!(*backend.seeds.borrow(), vec![10, 11]);
         assert_eq!(*backend.keyframe_counts.borrow(), vec![0, 1]);
+        let keyframes = backend.keyframes.borrow();
+        let seam_frame = ltx_chunk::plan(25, 17, 8).unwrap().get(1).unwrap().start;
+        let expected_keyframe = seam_frame.to_string().parse::<f32>().unwrap() / 100.0_f32;
+        let keyframe = keyframes.get(1).unwrap().as_ref().unwrap();
+        assert_eq!(keyframe.indices, vec![0]);
+        assert_eq!(keyframe.frame_count, 1);
+        assert_eq!(keyframe.width, 32);
+        assert_eq!(keyframe.height, 32);
+        assert_eq!(
+            keyframe.strength.to_bits(),
+            ltx_chunk::DEFAULT_KEYFRAME_STRENGTH.to_bits()
+        );
+        assert!(
+            keyframe
+                .frames
+                .iter()
+                .all(|value| (*value - expected_keyframe).abs() < 0.000_001)
+        );
     }
 
     #[test]

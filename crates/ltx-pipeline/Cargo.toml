@@ -14,8 +14,6 @@ ltx-io = { path = "../ltx-io" }
 ltx-shape = { path = "../ltx-shape" }
 thiserror.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

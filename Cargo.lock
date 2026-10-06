@@ -3216,7 +3216,6 @@ dependencies = [
  "ltx-chunk",
  "ltx-io",
  "ltx-shape",
- "tempfile",
  "thiserror 2.0.21",
 ]
 
