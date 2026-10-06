@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use burn::backend::NdArray;
+use burn::backend::{NdArray, ndarray::NdArrayDevice};
 use burn::tensor::Tensor;
 use ltx_vae_decoder::{DecoderConfig, DiffusionVideoDecoder};
 use ltx_weights::{KeyMap, WeightStore};
@@ -48,7 +48,7 @@ fn parity_full_decode() {
         DecoderConfig::from_vae_json(&config_json).expect("config must deserialize cleanly");
 
     // ── Build decoder from scope (same key names as Python state_dict) ─────
-    let device = Default::default();
+    let device = NdArrayDevice::default();
     let scope = store.scope("");
     let decoder = DiffusionVideoDecoder::<B>::load(&scope, &config, &device)
         .expect("decoder must load without error");
@@ -105,7 +105,7 @@ fn parity_full_decode() {
 
     for (idx, (got, exp)) in got_vals.iter().zip(exp_vals.iter()).enumerate() {
         let abs_diff = (got - exp).abs();
-        let tol = atol + rtol * exp.abs();
+        let tol = rtol.mul_add(exp.abs(), atol);
         if abs_diff > tol {
             fail_count += 1;
             if fail_count <= 5 {

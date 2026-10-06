@@ -7,7 +7,7 @@
 //! which expands channels and then rearranges them into the spatial axes.
 //!
 //! The 3-D pixel shuffle is performed axis by axis (W → H → T) to avoid
-//! intermediate tensors with more than 6 dimensions (NdArray's limit).
+//! intermediate tensors with more than 6 dimensions (`NdArray`'s limit).
 //!
 //! When `stride[0] == 2 && drop_leading_frame`, the first output time step
 //! is dropped.  This models the causal `1:2` temporal mapping (one latent
@@ -38,7 +38,7 @@ impl<B: Backend> LinearPixelShuffleUpsample<B> {
     /// duplicate leading frame is dropped iff `drop_leading_frame = true`.
     ///
     /// The 3-D pixel shuffle is decomposed into three 1-D shuffles (W, H, T)
-    /// to keep all intermediate tensors ≤ 6-D (NdArray limit).
+    /// to keep all intermediate tensors ≤ 6-D (`NdArray` limit).
     #[expect(clippy::many_single_char_names, reason = "tensor dim variables")]
     #[expect(
         clippy::arithmetic_side_effects,

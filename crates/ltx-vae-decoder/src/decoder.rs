@@ -418,10 +418,6 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
     ///
     /// Returns a [`VaeDecoderError`] if the config is invalid or any required
     /// weight key is missing.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "checkpoint key mapping is kept linear so field names stay auditable against the state dict"
-    )]
     pub fn load(
         scope: &ltx_weights::Scope<'_>,
         config: &DecoderConfig,

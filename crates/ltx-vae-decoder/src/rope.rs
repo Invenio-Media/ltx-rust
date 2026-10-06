@@ -109,10 +109,12 @@ pub fn rot_abs_axis<B: Backend>(
     let ro: Tensor<B, 6> = xe * sin_ang + xo * cos_ang;
 
     // Interleave via 3-D cat (avoids Tensor::stack::<7> which exceeds NdArray 6-D limit).
-    // re, ro: [d0,d1,d2,d3,d4,d_half] → each → [n, d_half, 1] → cat → [n, d_half, 2]
-    let re_3: Tensor<B, 3> = re.reshape([n, d_half, 1]);
-    let ro_3: Tensor<B, 3> = ro.reshape([n, d_half, 1]);
-    Tensor::cat(vec![re_3, ro_3], 2).reshape([d0, d1, d2, d3, d4, head_size])
+    // re, ro: [d0,d1,d2,d3,d4,d_half] → cat over a new trailing dim → reshape back.
+    Tensor::cat(
+        vec![re.reshape([n, d_half, 1]), ro.reshape([n, d_half, 1])],
+        2,
+    )
+    .reshape([d0, d1, d2, d3, d4, head_size])
 }
 
 /// Apply full-volume absolute `RoPE` to a `[B, T, H, W, NH, HD]` tensor.

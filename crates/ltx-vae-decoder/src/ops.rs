@@ -8,7 +8,7 @@
 //!   `c_flat = C · pw · ph + pw_sub · ph + ph_sub`
 //! where `pw` is the W-direction stride (outer) and `ph` is the H-direction
 //! stride (inner).  Both spatial shuffles are performed as two successive 1-D
-//! folds to keep all intermediate tensors ≤ 6-D (NdArray limit).
+//! folds to keep all intermediate tensors ≤ 6-D (`NdArray` limit).
 
 use burn::tensor::{Tensor, backend::Backend};
 
@@ -83,7 +83,6 @@ pub fn patchify<B: Backend>(
 /// # Errors
 ///
 /// Returns [`VaeDecoderError::InvalidArgument`] when C is not divisible by `p²`.
-#[expect(clippy::many_single_char_names, reason = "tensor dim variables")]
 #[expect(
     clippy::arithmetic_side_effects,
     reason = "Burn tensor ops run on device; Rust host integer overflow is not possible"
