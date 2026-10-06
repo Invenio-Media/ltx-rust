@@ -403,6 +403,484 @@ impl<B: Backend> DiffusionVideoDecoder<B> {
             true,
         )
     }
+
+    // ── Tiled decode ──────────────────────────────────────────────────────
+
+    /// Decode a latent tensor with optional spatial/temporal tiling.
+    ///
+    /// When `config` is `None`, this is identical to [`decode`].  When a
+    /// [`DecodeTileConfig`] is supplied the stage-4 feature tensor is split
+    /// into overlapping tiles; each tile runs through stage 4 and the
+    /// diffusion blocks independently, and the outputs are blended with
+    /// trapezoidal masks (partition-of-unity in overlap regions).
+    ///
+    /// ## Tiling API for backends
+    ///
+    /// The caller passes a `DecodeTileConfig` whose `frames`, `height`, and
+    /// `width` fields are **pixel / frame** units matching the output canvas.
+    /// A `TileDim { tile_size: 0, overlap: 0 }` (the default) means that
+    /// axis is not tiled.  Recommended minimum overlaps:
+    ///
+    /// - Temporal: `ceil(stage5_kernel_t / 2) * pixel_time_scale`
+    /// - Spatial: `ceil(stage5_kernel_hw / 2) * upsample4_stride_h * patch_size`
+    ///
+    /// Use `recommend_tile_config` to get conservative defaults from the
+    /// model config.
+    ///
+    /// `latent`: channels-first `[B, C_lat, F_l, H_l, W_l]`.
+    /// `noise`:  pixel-canvas noise `[B, C_out, F_pix, H_pix, W_pix]` or `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`VaeDecoderError`] on invalid arguments or decode failure.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic; all index and option accesses are bounds-checked.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "tiled decode blends outputs across tiles; the body is linear"
+    )]
+    pub fn decode_with_tiling(
+        &self,
+        latent: Tensor<B, 5>,
+        noise: Option<Tensor<B, 5>>,
+        config: Option<&crate::tiling::DecodeTileConfig>,
+        device: &B::Device,
+    ) -> Result<Tensor<B, 5>, VaeDecoderError> {
+        use crate::tiling::{TileDim, split_axis_tiles, trapezoidal_1d};
+
+        // Untiled path – delegate to decode().
+        let Some(cfg) =
+            config.filter(|c| c.frames.is_tiled() || c.height.is_tiled() || c.width.is_tiled())
+        else {
+            return self.decode(latent, noise, device);
+        };
+
+        let [b, _c, f_l, h_l, w_l] = latent.dims();
+
+        // Pixel content extents (for final crop).
+        let pixel_f = self.pixel_time_extent(f_l);
+        let pixel_h = h_l.saturating_mul(32);
+        let pixel_w = w_l.saturating_mul(32);
+
+        // NATTEN ghost pad + stages 1-3.
+        let latent_padded = crate::tiling::pad_trailing_latent(latent, self.natten_trailing_pad);
+        let feat_s4 = self.forward_stages_1_to_3(latent_padded, true, device);
+        let [_b, s4_t, s4_h, s4_w, _c_s4] = feat_s4.dims();
+
+        // Pixel canvas shape (from full feat_s4).
+        let full_ctx = self.forward_stage_4(feat_s4.clone(), true, device);
+        let [_, full_ctx_t, full_ctx_h, full_ctx_w, _] = full_ctx.dims();
+        let canvas_h = full_ctx_h.saturating_mul(self.patch_size);
+        let canvas_w = full_ctx_w.saturating_mul(self.patch_size);
+
+        // Temporal tiles in feat_s4-T space; pixel-unit tile sizes proportionally converted.
+        let t_cfg_s4 = if cfg.frames.is_tiled() && full_ctx_t > 0 {
+            let ratio_num = s4_t;
+            let ratio_den = full_ctx_t;
+            let ts_s4 = cfg
+                .frames
+                .tile_size
+                .saturating_mul(ratio_num)
+                .checked_div(ratio_den)
+                .unwrap_or(1)
+                .max(1);
+            let ov_s4 = cfg
+                .frames
+                .overlap
+                .saturating_mul(ratio_num)
+                .checked_div(ratio_den)
+                .unwrap_or(0);
+            TileDim {
+                tile_size: ts_s4,
+                overlap: ov_s4,
+            }
+        } else {
+            TileDim {
+                tile_size: 0,
+                overlap: 0,
+            }
+        };
+        let t_spans_s4 = split_axis_tiles(s4_t, t_cfg_s4)?;
+
+        // Spatial tiles are in pixel / context space.
+        let h_spans = split_axis_tiles(canvas_h, cfg.height)?;
+        let w_spans = split_axis_tiles(canvas_w, cfg.width)?;
+
+        if t_spans_s4.is_empty() || h_spans.is_empty() || w_spans.is_empty() {
+            return Err(VaeDecoderError::InvalidArgument {
+                detail: "tiling produced zero spans for at least one axis".to_owned(),
+            });
+        }
+
+        // Timestep schedule (same as decode()).
+        let n = self.num_inference_steps;
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_precision_loss,
+            reason = "n_steps ≤ 100; f32 precision sufficient"
+        )]
+        let timesteps: Vec<f32> = (0..n)
+            .map(|i| {
+                if n <= 1 {
+                    1.0_f32
+                } else {
+                    let frac = i as f32 / (n as f32 - 1.0);
+                    1.0_f32.mul_add(1.0 - frac, frac / n as f32)
+                }
+            })
+            .collect();
+
+        // Pixel output accumulator: Vec<f32> on host for scatter-free blending.
+        // Shape: [B, C_out, full_ctx_t, canvas_h, canvas_w]
+        let c_out = self.out_channels;
+        let out_vol = b
+            .saturating_mul(c_out)
+            .saturating_mul(full_ctx_t)
+            .saturating_mul(canvas_h)
+            .saturating_mul(canvas_w);
+        let wt_vol = b
+            .saturating_mul(full_ctx_t)
+            .saturating_mul(canvas_h)
+            .saturating_mul(canvas_w);
+        let mut out_acc = vec![0.0_f32; out_vol];
+        let mut wt_acc = vec![0.0_f32; wt_vol];
+
+        // Stage-4 spatial strides (for pixel→s4 coord conversion).
+        let s4_h_per_ctx_h = s4_h.checked_div(full_ctx_h).unwrap_or(1);
+        let s4_w_per_ctx_w = s4_w.checked_div(full_ctx_w).unwrap_or(1);
+
+        // Running context-T offset (incremented by tile_ctx_t after each temporal tile).
+        let mut ctx_t_start_offset = 0_usize;
+
+        for t_span_s4 in &t_spans_s4 {
+            // feat_s4 T range for this tile.
+            let s4_t_start = t_span_s4.start;
+            let s4_t_end = t_span_s4.end;
+            // t_mask length = tile_ctx_t (computed after forward_stage_4 below).
+            // Use the span ramps scaled to actual context-T (done per-tile).
+            let is_temporal_origin = s4_t_start == 0;
+
+            for h_span in &h_spans {
+                // Map pixel H to stage-4 H (H_pix / patch_size → context_h → s4_h).
+                let tile_ctx_h_start = h_span.start.checked_div(self.patch_size).unwrap_or(0);
+                let tile_ctx_h_end = h_span
+                    .end
+                    .checked_div(self.patch_size)
+                    .unwrap_or(full_ctx_h)
+                    .min(full_ctx_h);
+                let s4_tile_h_start = tile_ctx_h_start.saturating_mul(s4_h_per_ctx_h).min(s4_h);
+                let s4_tile_h_end = tile_ctx_h_end.saturating_mul(s4_h_per_ctx_h).min(s4_h);
+                let h_mask = trapezoidal_1d(h_span.len(), h_span.ramp_left, h_span.ramp_right)?;
+
+                for w_span in &w_spans {
+                    let ctx_w0 = w_span.start.checked_div(self.patch_size).unwrap_or(0);
+                    let ctx_w1 = w_span
+                        .end
+                        .checked_div(self.patch_size)
+                        .unwrap_or(full_ctx_w)
+                        .min(full_ctx_w);
+                    let s4w_tile_start = ctx_w0.saturating_mul(s4_w_per_ctx_w).min(s4_w);
+                    let s4w_tile_end = ctx_w1.saturating_mul(s4_w_per_ctx_w).min(s4_w);
+                    let w_mask = trapezoidal_1d(w_span.len(), w_span.ramp_left, w_span.ramp_right)?;
+
+                    // Slice stage-4 feature tile.
+                    let feat_tile: Tensor<B, 5> = feat_s4.clone().slice([
+                        0..b,
+                        s4_t_start..s4_t_end,
+                        s4_tile_h_start..s4_tile_h_end,
+                        s4w_tile_start..s4w_tile_end,
+                        0..feat_s4.dims()[4],
+                    ]);
+
+                    // Stage 4 + ghost crop → tile context.
+                    let tile_ctx = self.forward_stage_4(feat_tile, is_temporal_origin, device);
+                    let [_, tile_ctx_t, tile_ctx_h, tile_ctx_w, _] = tile_ctx.dims();
+                    let tile_canvas_h = tile_ctx_h.saturating_mul(self.patch_size);
+                    let tile_canvas_w = tile_ctx_w.saturating_mul(self.patch_size);
+
+                    // Build or slice noise for this tile.
+                    let tile_noise: Tensor<B, 5> = noise.as_ref().map_or_else(
+                        || {
+                            Tensor::zeros(
+                                [b, c_out, tile_ctx_t, tile_canvas_h, tile_canvas_w],
+                                device,
+                            )
+                        },
+                        |ns| {
+                            let t_ns_start = ctx_t_start_offset;
+                            let t_ns_end =
+                                (ctx_t_start_offset.saturating_add(tile_ctx_t)).min(ns.dims()[2]);
+                            let h_ns_end = h_span
+                                .end
+                                .min(tile_canvas_h.saturating_add(h_span.start))
+                                .min(ns.dims()[3]);
+                            let w_ns_end = w_span
+                                .end
+                                .min(tile_canvas_w.saturating_add(w_span.start))
+                                .min(ns.dims()[4]);
+                            ns.clone().slice([
+                                0..b,
+                                0..c_out,
+                                t_ns_start..t_ns_end,
+                                h_span.start..h_ns_end,
+                                w_span.start..w_ns_end,
+                            ])
+                        },
+                    );
+
+                    // Decode this tile.
+                    let tile_pixels =
+                        self.decode_one_tile(&tile_ctx, tile_noise, &timesteps, device)?;
+
+                    // Convert tile pixels to f32 host data.
+                    let tile_data = tile_pixels.into_data().convert::<f32>();
+                    let tile_vals = tile_data.as_slice::<f32>().map_err(|e| {
+                        VaeDecoderError::InvalidArgument {
+                            detail: format!("tile pixel data slice: {e}"),
+                        }
+                    })?;
+
+                    // Build temporal mask for this tile (size = tile_ctx_t).
+                    let t_mask =
+                        trapezoidal_1d(tile_ctx_t, t_span_s4.ramp_left, t_span_s4.ramp_right)?;
+
+                    let t_len = tile_ctx_t;
+                    let h_len = h_span.len().min(tile_canvas_h);
+                    let w_len = w_span.len().min(tile_canvas_w);
+
+                    for bi in 0..b {
+                        for ti in 0..t_len {
+                            let tm = t_mask.get(ti).copied().unwrap_or(1.0_f32);
+                            let out_t = ctx_t_start_offset.saturating_add(ti);
+                            if out_t >= full_ctx_t {
+                                break;
+                            }
+                            for hi in 0..h_len {
+                                let hm = h_mask.get(hi).copied().unwrap_or(1.0_f32);
+                                let out_h = h_span.start.saturating_add(hi);
+                                for wi in 0..w_len {
+                                    let wm = w_mask.get(wi).copied().unwrap_or(1.0_f32);
+                                    let out_w = w_span.start.saturating_add(wi);
+                                    let weight = tm * hm * wm;
+
+                                    // Weight accumulator (no C dim): updated once per (t,h,w).
+                                    let wdst = bi
+                                        .saturating_mul(
+                                            full_ctx_t
+                                                .saturating_mul(canvas_h)
+                                                .saturating_mul(canvas_w),
+                                        )
+                                        .saturating_add(
+                                            out_t.saturating_mul(canvas_h.saturating_mul(canvas_w)),
+                                        )
+                                        .saturating_add(out_h.saturating_mul(canvas_w))
+                                        .saturating_add(out_w);
+                                    if let Some(wdst_slot) = wt_acc.get_mut(wdst) {
+                                        *wdst_slot += weight;
+                                    }
+
+                                    // Output accumulator: one entry per channel.
+                                    for ci in 0..c_out {
+                                        let src_idx = bi
+                                            .saturating_mul(
+                                                c_out
+                                                    .saturating_mul(tile_ctx_t)
+                                                    .saturating_mul(tile_canvas_h)
+                                                    .saturating_mul(tile_canvas_w),
+                                            )
+                                            .saturating_add(
+                                                ci.saturating_mul(
+                                                    tile_ctx_t
+                                                        .saturating_mul(tile_canvas_h)
+                                                        .saturating_mul(tile_canvas_w),
+                                                ),
+                                            )
+                                            .saturating_add(ti.saturating_mul(
+                                                tile_canvas_h.saturating_mul(tile_canvas_w),
+                                            ))
+                                            .saturating_add(hi.saturating_mul(tile_canvas_w))
+                                            .saturating_add(wi);
+                                        let dst_idx = bi
+                                            .saturating_mul(
+                                                c_out
+                                                    .saturating_mul(full_ctx_t)
+                                                    .saturating_mul(canvas_h)
+                                                    .saturating_mul(canvas_w),
+                                            )
+                                            .saturating_add(
+                                                ci.saturating_mul(
+                                                    full_ctx_t
+                                                        .saturating_mul(canvas_h)
+                                                        .saturating_mul(canvas_w),
+                                                ),
+                                            )
+                                            .saturating_add(
+                                                out_t.saturating_mul(
+                                                    canvas_h.saturating_mul(canvas_w),
+                                                ),
+                                            )
+                                            .saturating_add(out_h.saturating_mul(canvas_w))
+                                            .saturating_add(out_w);
+                                        if let (Some(src), Some(dst)) =
+                                            (tile_vals.get(src_idx), out_acc.get_mut(dst_idx))
+                                        {
+                                            *dst += src * weight;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Advance context-T offset by the actual context-T extent of this temporal tile.
+            // Peek at tile_ctx_t by calling forward_stage_4 for the first spatial tile;
+            // it's the same for all spatial tiles of this temporal strip.
+            {
+                let probe_h = h_spans
+                    .first()
+                    .ok_or_else(|| VaeDecoderError::InvalidArgument {
+                        detail: "h_spans empty".to_owned(),
+                    })?;
+                let probe_w = w_spans
+                    .first()
+                    .ok_or_else(|| VaeDecoderError::InvalidArgument {
+                        detail: "w_spans empty".to_owned(),
+                    })?;
+                let tile_ctx_h_probe = probe_h.start.checked_div(self.patch_size).unwrap_or(0);
+                let tile_ctx_h_probe_end = probe_h
+                    .end
+                    .checked_div(self.patch_size)
+                    .unwrap_or(full_ctx_h)
+                    .min(full_ctx_h);
+                let s4ph_start = tile_ctx_h_probe.saturating_mul(s4_h_per_ctx_h).min(s4_h);
+                let s4ph_end = tile_ctx_h_probe_end
+                    .saturating_mul(s4_h_per_ctx_h)
+                    .min(s4_h);
+                let ctx_w0p = probe_w.start.checked_div(self.patch_size).unwrap_or(0);
+                let ctx_w1p = probe_w
+                    .end
+                    .checked_div(self.patch_size)
+                    .unwrap_or(full_ctx_w)
+                    .min(full_ctx_w);
+                let probe_s4w_start = ctx_w0p.saturating_mul(s4_w_per_ctx_w).min(s4_w);
+                let probe_s4w_end = ctx_w1p.saturating_mul(s4_w_per_ctx_w).min(s4_w);
+                let probe_tile: Tensor<B, 5> = feat_s4.clone().slice([
+                    0..b,
+                    s4_t_start..s4_t_end,
+                    s4ph_start..s4ph_end,
+                    probe_s4w_start..probe_s4w_end,
+                    0..feat_s4.dims()[4],
+                ]);
+                let probe_ctx = self.forward_stage_4(probe_tile, is_temporal_origin, device);
+                ctx_t_start_offset = ctx_t_start_offset.saturating_add(probe_ctx.dims()[1]);
+            }
+        }
+
+        // Normalize by accumulated weights.
+        for bi in 0..b {
+            for ci in 0..c_out {
+                for ti in 0..full_ctx_t {
+                    for hi in 0..canvas_h {
+                        for wi in 0..canvas_w {
+                            let wdst = bi
+                                .saturating_mul(
+                                    full_ctx_t.saturating_mul(canvas_h).saturating_mul(canvas_w),
+                                )
+                                .saturating_add(
+                                    ti.saturating_mul(canvas_h.saturating_mul(canvas_w)),
+                                )
+                                .saturating_add(hi.saturating_mul(canvas_w))
+                                .saturating_add(wi);
+                            let dst_idx = bi
+                                .saturating_mul(
+                                    c_out
+                                        .saturating_mul(full_ctx_t)
+                                        .saturating_mul(canvas_h)
+                                        .saturating_mul(canvas_w),
+                                )
+                                .saturating_add(ci.saturating_mul(
+                                    full_ctx_t.saturating_mul(canvas_h).saturating_mul(canvas_w),
+                                ))
+                                .saturating_add(
+                                    ti.saturating_mul(canvas_h.saturating_mul(canvas_w)),
+                                )
+                                .saturating_add(hi.saturating_mul(canvas_w))
+                                .saturating_add(wi);
+                            let w = wt_acc.get(wdst).copied().unwrap_or(1.0);
+                            if let Some(slot) = out_acc.get_mut(dst_idx) {
+                                *slot /= w.max(1e-8_f32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reconstruct tensor from host data: create 1-D then reshape.
+        let pixels: Tensor<B, 5> = Tensor::<B, 1>::from_floats(out_acc.as_slice(), device)
+            .reshape([b, c_out, full_ctx_t, canvas_h, canvas_w]);
+
+        // Crop to content.
+        let [b_out, c_out2, f_out, h_out, w_out] = pixels.dims();
+        let f_keep = f_out.min(pixel_f);
+        let h_keep = h_out.min(pixel_h);
+        let w_keep = w_out.min(pixel_w);
+        Ok(pixels.slice([0..b_out, 0..c_out2, 0..f_keep, 0..h_keep, 0..w_keep]))
+    }
+
+    /// Conservative tile config for production-scale decode on this model.
+    ///
+    /// Returns a `DecodeTileConfig` whose tile sizes are the minimum that
+    /// fit each stage's NA kernel, with overlaps chosen so border queries
+    /// always fall inside the window.  Backends should use this as a floor
+    /// and may increase tile sizes based on available memory.
+    ///
+    /// Tile sizes are in **pixel / frame** units.
+    #[must_use]
+    pub fn recommend_tile_config(&self) -> crate::tiling::DecodeTileConfig {
+        use crate::tiling::{DecodeTileConfig, TileDim};
+
+        // Minimum pixel overlap: enough for border queries to see a full window.
+        // overlap_t = ceil(stage5_kernel_t / 2) * pixel_time_scale
+        let stage5_kt = self.stage5_kernel_t;
+        let ov_t = stage5_kt
+            .saturating_add(1)
+            .checked_div(2)
+            .unwrap_or(1)
+            .saturating_mul(self.pixel_time_scale());
+
+        // Spatial overlap: per-pixel, proportional to up4 stride and patch.
+        let patch = self.patch_size;
+        let ov_hw = self
+            .up4_stride
+            .get(1)
+            .copied()
+            .unwrap_or(2)
+            .saturating_mul(patch)
+            .saturating_mul(4); // conservative: 4 kernel-half-widths of coverage
+
+        // Minimum tile: twice the overlap so masks are complementary.
+        let min_t = ov_t.saturating_mul(2).max(16);
+        let min_hw = ov_hw.saturating_mul(2).max(64);
+
+        DecodeTileConfig {
+            frames: TileDim {
+                tile_size: min_t,
+                overlap: ov_t,
+            },
+            height: TileDim {
+                tile_size: min_hw,
+                overlap: ov_hw,
+            },
+            width: TileDim {
+                tile_size: min_hw,
+                overlap: ov_hw,
+            },
+        }
+    }
 }
 
 // ─── Construction ─────────────────────────────────────────────────────────────

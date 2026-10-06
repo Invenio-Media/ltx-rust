@@ -1,16 +1,210 @@
 //! Decode-window geometry for the diffusion VAE decoder.
 //!
 //! Provides:
+//! - [`DecodeTileConfig`]: tile sizes and overlaps for one decode call.
 //! - [`stage_min_tile_size`]: per-axis latent floor so every NA kernel fits.
 //! - [`pad_trailing_latent`]: NATTEN last-frame border ghost-pad.
 //! - [`crop_trailing_context`]: remove ghost-pad appendix before stage 5.
 //! - [`ensure_min_latent`]: symmetric padding to reach the floor size.
 //! - [`decode_window_pixels`]: report the decode-tile pixel extent for budget.
 //! - [`stage4_thw`]: compute stage-4 shape from a latent shape.
+//! - [`split_axis_tiles`]: compute tile start/end/ramp slices for one axis.
+//! - [`trapezoidal_1d`]: 1-D trapezoidal blend weights.
 
 use crate::config::UpsampleSpec;
 use crate::error::VaeDecoderError;
 use burn::tensor::{Tensor, backend::Backend};
+
+// ─── Tile config ─────────────────────────────────────────────────────────────
+
+/// Per-axis tile size and overlap in pixel / frame units.
+///
+/// `tile_size = 0` means this axis is not tiled (uses the full extent).
+/// When `tile_size > 0`, `overlap` must satisfy `overlap < tile_size`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TileDim {
+    /// Tile size in pixels (frames for the temporal axis).  0 = untiled.
+    pub tile_size: usize,
+    /// Number of pixels (frames) of overlap between adjacent tiles.
+    pub overlap: usize,
+}
+
+impl TileDim {
+    /// True when this axis has a positive tile size.
+    #[must_use]
+    pub const fn is_tiled(self) -> bool {
+        self.tile_size > 0
+    }
+}
+
+/// Tiling configuration for `DiffusionVideoDecoder::decode_with_tiling`.
+///
+/// Sizes and overlaps are in **pixel / frame** units.  When a dimension's
+/// `tile_size` is 0 the whole axis is decoded in one pass.
+///
+/// ## Relationship to the reference `AUTO_TILING`
+///
+/// The Python pipeline calls `ensure_tiling_config` which resolves
+/// `AUTO_TILING` → `TileSizeConfig` based on available GPU memory, model
+/// sizes, and the `CHUNKED_EAGER` mode multiplier (coef = 5).  The backend
+/// should call `DiffusionVideoDecoder::recommend_tile_config` (or supply a
+/// hand-tuned `DecodeTileConfig`) and pass it to `decode_with_tiling`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecodeTileConfig {
+    /// Temporal tiling (in frames).
+    pub frames: TileDim,
+    /// Height tiling (in pixels).
+    pub height: TileDim,
+    /// Width tiling (in pixels).
+    pub width: TileDim,
+}
+
+// ─── Tile schedule helpers ────────────────────────────────────────────────────
+
+/// One tile's extent and blend ramps along a single axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileSpan {
+    /// Inclusive start index (in the grid / pixel domain).
+    pub start: usize,
+    /// Exclusive end index.
+    pub end: usize,
+    /// Number of positions with a left-side blend ramp (fade-in).
+    pub ramp_left: usize,
+    /// Number of positions with a right-side blend ramp (fade-out).
+    pub ramp_right: usize,
+}
+
+impl TileSpan {
+    /// Length of this span.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    /// True when this span covers zero elements.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.end <= self.start
+    }
+}
+
+/// Compute the tile spans for one axis.
+///
+/// When `dim.tile_size == 0` (untiled), returns a single span
+/// `(0, total, 0, 0)`.  Otherwise splits `total` into tiles of size
+/// `dim.tile_size` with `dim.overlap` frames of overlap.  The last tile
+/// always extends to `total` and its size may be smaller than
+/// `dim.tile_size` (the reference grows short last tiles leftward; we
+/// simply extend to `total`).
+///
+/// Ramps match the reference `compute_trapezoidal_mask_1d` convention:
+/// the first tile has `ramp_right = overlap`, interior tiles have both
+/// ramps, the last tile has `ramp_left = overlap` and no right ramp.
+///
+/// # Errors
+///
+/// Returns [`VaeDecoderError::InvalidArgument`] when `overlap >= tile_size`.
+pub fn split_axis_tiles(total: usize, dim: TileDim) -> Result<Vec<TileSpan>, VaeDecoderError> {
+    if !dim.is_tiled() {
+        return Ok(vec![TileSpan {
+            start: 0,
+            end: total,
+            ramp_left: 0,
+            ramp_right: 0,
+        }]);
+    }
+    let tile = dim.tile_size;
+    let ov = dim.overlap;
+    if ov >= tile {
+        return Err(VaeDecoderError::InvalidArgument {
+            detail: format!("tile overlap {ov} must be less than tile_size {tile}"),
+        });
+    }
+    if total == 0 {
+        return Ok(vec![]);
+    }
+    let stride = tile.saturating_sub(ov);
+    let mut spans = Vec::new();
+    let mut start = 0_usize;
+    let mut is_first = true;
+    loop {
+        let end = (start.saturating_add(tile)).min(total);
+        let ramp_left = if is_first { 0 } else { ov };
+        // Only the last tile has no right ramp.
+        let ramp_right = if end >= total { 0 } else { ov };
+        spans.push(TileSpan {
+            start,
+            end,
+            ramp_left,
+            ramp_right,
+        });
+        if end >= total {
+            break;
+        }
+        start = start.saturating_add(stride);
+        is_first = false;
+    }
+    Ok(spans)
+}
+
+/// Build a 1-D trapezoidal blend-weight vector.
+///
+/// Matches the Python reference `compute_trapezoidal_mask_1d` with
+/// `left_starts_from_0 = false`:
+///
+/// - Left ramp (fade-in): `1/(L+1), 2/(L+1), …, L/(L+1)` where `L = ramp_left`.
+/// - Middle: 1.0.
+/// - Right ramp (fade-out): `L/(L+1), …, 1/(L+1)` where `L = ramp_right`.
+///
+/// Adjacent tiles' ramps sum to 1 (partition-of-unity / complementary masks).
+///
+/// # Errors
+///
+/// Returns [`VaeDecoderError::InvalidArgument`] when `length == 0`.
+pub fn trapezoidal_1d(
+    length: usize,
+    ramp_left: usize,
+    ramp_right: usize,
+) -> Result<Vec<f32>, VaeDecoderError> {
+    if length == 0 {
+        return Err(VaeDecoderError::InvalidArgument {
+            detail: "trapezoidal_1d: length must be > 0".to_owned(),
+        });
+    }
+    let rl = ramp_left.min(length);
+    let rr = ramp_right.min(length);
+    let mut v = vec![1.0_f32; length];
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "ramp indices are at most 'length' ≤ usize::MAX; ramp sizes fit in f32 for all practical tile sizes (≤ 32768)"
+    )]
+    for i in 0..rl {
+        let numerator = i.saturating_add(1) as f32;
+        let denominator = rl.saturating_add(1) as f32;
+        let w = numerator / denominator;
+        if let Some(slot) = v.get_mut(i) {
+            *slot = w.clamp(0.0_f32, 1.0_f32);
+        }
+    }
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "ramp indices are at most 'length'; fits in f32 for practical tile sizes"
+    )]
+    for i in 0..rr {
+        let from_end = rr.saturating_sub(1).saturating_sub(i);
+        let numerator = from_end.saturating_add(1) as f32;
+        let denominator = rr.saturating_add(1) as f32;
+        let w = numerator / denominator;
+        let slot_idx = length.saturating_sub(1).saturating_sub(i);
+        if let Some(slot) = v.get_mut(slot_idx) {
+            let bounded = (*slot).min(w);
+            *slot = bounded.clamp(0.0_f32, 1.0_f32);
+        }
+    }
+    Ok(v)
+}
 
 /// Per-axis latent-grid floor `[t, h, w]` so each NA stage sees dims ≥ kernel.
 ///
