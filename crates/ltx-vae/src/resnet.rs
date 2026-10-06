@@ -147,6 +147,72 @@ impl<B: Backend> ResnetBlock3D<B> {
 
         residual.add(h)
     }
+
+    /// Load all parameters from a [`ltx_weights::Scope`].
+    ///
+    /// Key names match the reference `ResnetBlock3D.state_dict()`:
+    /// - `conv1.conv.weight`, `conv1.conv.bias`
+    /// - `conv2.conv.weight`, `conv2.conv.bias`
+    /// - `conv_shortcut.weight`, `conv_shortcut.bias` (when channels change)
+    /// - `norm3.weight`, `norm3.bias` (when channels change)
+    /// - `norm1.weight`, `norm1.bias` (when using `GroupNorm`)
+    /// - `norm2.weight`, `norm2.bias` (when using `GroupNorm`)
+    ///
+    /// # Errors
+    /// Returns [`VaeError::Load`] if any expected tensor is missing or wrong rank.
+    pub(crate) fn load_weights_from_scope(
+        &mut self,
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<(), VaeError> {
+        self.norm1
+            .load_weights_from_scope(&scope.scope("norm1"), device)?;
+        self.conv1
+            .load_weights_from_scope(&scope.scope("conv1"), device)?;
+        self.norm2
+            .load_weights_from_scope(&scope.scope("norm2"), device)?;
+        self.conv2
+            .load_weights_from_scope(&scope.scope("conv2"), device)?;
+        if let Some(sc) = &mut self.shortcut_conv {
+            let exp_w = sc.conv.weight.lazy_shape().to_vec();
+            let exp_b: Option<Vec<usize>> = sc.conv.bias.as_ref().map(|p| p.lazy_shape().to_vec());
+            sc.conv.weight = crate::load_util::load_param::<B, 5>(
+                scope,
+                "conv_shortcut.weight",
+                &exp_w,
+                device,
+            )?;
+            if let Some(exp) = exp_b {
+                sc.conv.bias = Some(crate::load_util::load_param::<B, 1>(
+                    scope,
+                    "conv_shortcut.bias",
+                    &exp,
+                    device,
+                )?);
+            }
+        }
+        if let Some(sn) = &mut self.shortcut_norm {
+            let exp_g: Option<Vec<usize>> = sn.gamma.as_ref().map(|p| p.lazy_shape().to_vec());
+            let exp_b: Option<Vec<usize>> = sn.beta.as_ref().map(|p| p.lazy_shape().to_vec());
+            if let Some(exp) = exp_g {
+                sn.gamma = Some(crate::load_util::load_param::<B, 1>(
+                    scope,
+                    "norm3.weight",
+                    &exp,
+                    device,
+                )?);
+            }
+            if let Some(exp) = exp_b {
+                sn.beta = Some(crate::load_util::load_param::<B, 1>(
+                    scope,
+                    "norm3.bias",
+                    &exp,
+                    device,
+                )?);
+            }
+        }
+        Ok(())
+    }
 }
 
 // ── UNetMidBlock3D ────────────────────────────────────────────────────────────
@@ -192,6 +258,24 @@ impl<B: Backend> UNetMidBlock3D<B> {
             x = block.forward(x);
         }
         x
+    }
+
+    /// Load all parameters from a [`ltx_weights::Scope`].
+    ///
+    /// Reads `res_blocks.{i}.*` for each block, matching the reference
+    /// `UNetMidBlock3D.state_dict()` key names.
+    ///
+    /// # Errors
+    /// Returns [`VaeError::Load`] if any tensor is missing or wrong rank.
+    pub(crate) fn load_weights_from_scope(
+        &mut self,
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<(), VaeError> {
+        for (i, block) in self.res_blocks.iter_mut().enumerate() {
+            block.load_weights_from_scope(&scope.scope(&format!("res_blocks.{i}")), device)?;
+        }
+        Ok(())
     }
 }
 

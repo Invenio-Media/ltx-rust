@@ -121,6 +121,22 @@ impl<B: Backend> SpaceToDepthDownsample<B> {
 
         Ok(x_conv.add(x_skip))
     }
+
+    /// Load convolution weights from a [`ltx_weights::Scope`].
+    ///
+    /// Reads `conv.conv.weight` and `conv.conv.bias` relative to `scope`,
+    /// matching the reference `SpaceToDepthDownsample.state_dict()` key names.
+    ///
+    /// # Errors
+    /// Returns [`VaeError::Load`] if any tensor is missing or wrong rank.
+    pub(crate) fn load_weights_from_scope(
+        &mut self,
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<(), VaeError> {
+        self.conv
+            .load_weights_from_scope(&scope.scope("conv"), device)
+    }
 }
 
 // ── pixel_shuffle_5d ──────────────────────────────────────────────────────────
@@ -175,40 +191,69 @@ fn fold_temporal<B: Backend>(x: Tensor<B, 5>, stride_t: usize) -> Result<Tensor<
 }
 
 /// `(B, C, F, H*sh, W)` → `(B, C*sh, F, H, W)`.
+///
+/// Uses `B·F` as the outer batch to keep the frame dimension `F` from
+/// mixing with the height-stride index during the intermediate reshape.
 fn fold_height<B: Backend>(x: Tensor<B, 5>, stride_h: usize) -> Result<Tensor<B, 5>, VaeError> {
     let [nb, nc, nf, h_in, nw] = x.dims();
-    let h_out = h_in.checked_div(stride_h).ok_or(VaeError::DimOverflow)?;
+    let h_out = h_in
+        .checked_div(stride_h)
+        .filter(|&v| v.checked_mul(stride_h) == Some(h_in))
+        .ok_or_else(|| {
+            VaeError::Config(format!("H={h_in} is not divisible by stride_h={stride_h}"))
+        })?;
     let c_out = nc.checked_mul(stride_h).ok_or(VaeError::DimOverflow)?;
-    let bcf = nb
-        .checked_mul(nc)
-        .and_then(|v| v.checked_mul(nf))
-        .ok_or(VaeError::DimOverflow)?;
+    let bf = nb.checked_mul(nf).ok_or(VaeError::DimOverflow)?;
 
-    let x4: burn::tensor::Tensor<B, 4> = x.reshape([bcf, h_out, stride_h, nw]);
-    let x4 = x4.swap_dims(1, 2);
-    let bcf_sh = bcf.checked_mul(stride_h).ok_or(VaeError::DimOverflow)?;
-    Ok(x4
-        .reshape([bcf_sh, h_out, nw, 1])
-        .reshape([nb, c_out, nf, h_out, nw]))
+    // (B, C, F, H, W)
+    // → swap(1,2) → (B, F, C, H, W)
+    // → reshape  → (B·F, C, H, W)
+    // → reshape  → (B·F, C, h_out, stride_h, W)
+    // → swap(2,3)→ (B·F, C, stride_h, h_out, W)
+    // → reshape  → (B·F, C·sh, h_out, W)           channel = c·sh + sh_idx
+    // → reshape  → (B, F, C·sh, h_out, W)
+    // → swap(1,2)→ (B, C·sh, F, h_out, W)
+    let x = x.swap_dims(1, 2);
+    let x4: burn::tensor::Tensor<B, 4> = x.reshape([bf, nc, h_in, nw]);
+    let x5: burn::tensor::Tensor<B, 5> = x4.reshape([bf, nc, h_out, stride_h, nw]);
+    let x5 = x5.swap_dims(2, 3);
+    let x4: burn::tensor::Tensor<B, 4> = x5.reshape([bf, c_out, h_out, nw]);
+    let x5: burn::tensor::Tensor<B, 5> = x4.reshape([nb, nf, c_out, h_out, nw]);
+    Ok(x5.swap_dims(1, 2))
 }
 
 /// `(B, C, F, H, W*sw)` → `(B, C*sw, F, H, W)`.
+///
+/// Uses `B·F` as the outer batch to keep the frame dimension `F` from
+/// mixing with the width-stride index during the intermediate reshape.
 fn fold_width<B: Backend>(x: Tensor<B, 5>, stride_w: usize) -> Result<Tensor<B, 5>, VaeError> {
     let [nb, nc, nf, nh, w_in] = x.dims();
-    let w_out = w_in.checked_div(stride_w).ok_or(VaeError::DimOverflow)?;
+    let w_out = w_in
+        .checked_div(stride_w)
+        .filter(|&v| v.checked_mul(stride_w) == Some(w_in))
+        .ok_or_else(|| {
+            VaeError::Config(format!("W={w_in} is not divisible by stride_w={stride_w}"))
+        })?;
     let c_out = nc.checked_mul(stride_w).ok_or(VaeError::DimOverflow)?;
-    let bcfh = nb
-        .checked_mul(nc)
-        .and_then(|v| v.checked_mul(nf))
-        .and_then(|v| v.checked_mul(nh))
-        .ok_or(VaeError::DimOverflow)?;
+    let bf = nb.checked_mul(nf).ok_or(VaeError::DimOverflow)?;
 
-    let x3: burn::tensor::Tensor<B, 3> = x.reshape([bcfh, w_out, stride_w]);
-    let x3 = x3.swap_dims(1, 2);
-    let bcfh_sw = bcfh.checked_mul(stride_w).ok_or(VaeError::DimOverflow)?;
-    Ok(x3
-        .reshape([bcfh_sw, w_out, 1])
-        .reshape([nb, c_out, nf, nh, w_out]))
+    // (B, C, F, H, W)
+    // → swap(1,2) → (B, F, C, H, W)
+    // → reshape  → (B·F, C, H, W)
+    // → reshape  → (B·F, C, H, w_out, stride_w)
+    // → swap(3,4)→ (B·F, C, H, stride_w, w_out)
+    // → swap(2,3)→ (B·F, C, stride_w, H, w_out)
+    // → reshape  → (B·F, C·sw, H, w_out)            channel = c·sw + sw_idx
+    // → reshape  → (B, F, C·sw, H, w_out)
+    // → swap(1,2)→ (B, C·sw, F, H, w_out)
+    let x = x.swap_dims(1, 2);
+    let x4: burn::tensor::Tensor<B, 4> = x.reshape([bf, nc, nh, w_in]);
+    let x5: burn::tensor::Tensor<B, 5> = x4.reshape([bf, nc, nh, w_out, stride_w]);
+    let x5 = x5.swap_dims(3, 4);
+    let x5 = x5.swap_dims(2, 3);
+    let x4: burn::tensor::Tensor<B, 4> = x5.reshape([bf, c_out, nh, w_out]);
+    let x5: burn::tensor::Tensor<B, 5> = x4.reshape([nb, nf, c_out, nh, w_out]);
+    Ok(x5.swap_dims(1, 2))
 }
 
 // ── channel_avg ───────────────────────────────────────────────────────────────

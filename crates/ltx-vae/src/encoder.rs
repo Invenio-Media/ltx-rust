@@ -90,6 +90,34 @@ impl<B: Backend> EncoderBlock<B> {
     }
 }
 
+impl<B: Backend> EncoderBlock<B> {
+    /// Load weights from a [`ltx_weights::Scope`].
+    ///
+    /// Dispatches to the block-specific loader.  Key paths match the
+    /// reference `VideoEncoder.down_blocks[i].state_dict()` names.
+    ///
+    /// # Errors
+    /// Returns [`VaeError::Load`] if any tensor is missing or wrong rank.
+    pub(crate) fn load_weights_from_scope(
+        &mut self,
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<(), VaeError> {
+        match self {
+            Self::ResX(b) => b.load_weights_from_scope(scope, device),
+            Self::ResXY(b) => b.load_weights_from_scope(scope, device),
+            Self::CompressTime(b)
+            | Self::CompressSpace(b)
+            | Self::CompressAll(b)
+            | Self::CompressAllXY(b) => b.load_weights_from_scope(scope, device),
+            Self::CompressAllRes(b) | Self::CompressSpaceRes(b) | Self::CompressTimeRes(b) => {
+                b.load_weights_from_scope(scope, device)
+            }
+            Self::Attn(b) => b.load_weights_from_scope(scope, device),
+        }
+    }
+}
+
 // ── VideoEncoder ──────────────────────────────────────────────────────────────
 
 /// LTX-2.5 video VAE encoder.
@@ -385,6 +413,77 @@ impl<B: Backend> VideoEncoder<B> {
     #[must_use]
     pub const fn latent_channels(&self) -> usize {
         self.latent_channels
+    }
+}
+
+impl<B: Backend> VideoEncoder<B> {
+    /// Build a `VideoEncoder` from checkpoint weights.
+    ///
+    /// # Key mapping
+    ///
+    /// For parity fixtures saved with `module.state_dict()` names, open the
+    /// [`ltx_weights::WeightStore`] with [`ltx_weights::KeyMap::identity`] and
+    /// pass the root scope.
+    ///
+    /// For real LTX-2.5 diffusion-VAE checkpoints, open with
+    /// [`ltx_weights::KeyMap::video_encoder`]; the map strips `vae.encoder.` /
+    /// `encoder.` prefixes and renames `vae.per_channel_statistics.*` →
+    /// `per_channel_statistics.*`, after which call this function with the
+    /// root scope.  This code path follows the reference `VAE_ENCODER_COMFY_KEYS_FILTER`
+    /// `SDOps` exactly; it is documented but not integration-tested in this crate
+    /// (no real Lightricks checkpoint is available locally).
+    ///
+    /// # Conv weight layout
+    ///
+    /// `CausalConv3d` and all conv blocks store weights as `PyTorch`
+    /// `[out, in/groups, kT, kH, kW]` — Burn uses the same layout for 3-D
+    /// convolutions, so no transposition is applied.
+    ///
+    /// # Errors
+    /// Returns [`VaeError`] if construction fails, if any weight tensor is
+    /// missing or has the wrong rank, or if a loaded shape does not match the
+    /// config-derived expectation.
+    pub fn load(
+        scope: &ltx_weights::Scope<'_>,
+        config: &VaeEncoderConfig,
+        device: &B::Device,
+    ) -> Result<Self, VaeError> {
+        let mut encoder = Self::new(config, device)?;
+
+        // ── per-channel normalisation statistics ──────────────────────────────
+        let stats_scope = scope.scope("per_channel_statistics");
+        let stats = PerChannelStatistics::load_from_scope(&stats_scope, device)?;
+        // Validate that the checkpoint's latent channel count matches the config.
+        let got_ch = stats.std_of_means.dims()[0];
+        if got_ch != config.out_channels {
+            return Err(VaeError::Config(format!(
+                "`per_channel_statistics.std-of-means`: expected [{0}], got [{1}]",
+                config.out_channels, got_ch
+            )));
+        }
+        encoder.per_channel_statistics = stats;
+
+        // ── conv_in ───────────────────────────────────────────────────────────
+        encoder
+            .conv_in
+            .load_weights_from_scope(&scope.scope("conv_in"), device)?;
+
+        // ── encoder blocks ────────────────────────────────────────────────────
+        for (i, block) in encoder.down_blocks.iter_mut().enumerate() {
+            block.load_weights_from_scope(&scope.scope(&format!("down_blocks.{i}")), device)?;
+        }
+
+        // ── conv_norm_out (PixelNorm: no params; GroupNorm: weight + bias) ────
+        encoder
+            .conv_norm_out
+            .load_weights_from_scope(&scope.scope("conv_norm_out"), device)?;
+
+        // ── conv_out ──────────────────────────────────────────────────────────
+        encoder
+            .conv_out
+            .load_weights_from_scope(&scope.scope("conv_out"), device)?;
+
+        Ok(encoder)
     }
 }
 

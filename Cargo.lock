@@ -3356,6 +3356,7 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "ltx-shape",
+ "ltx-weights",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

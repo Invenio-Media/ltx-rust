@@ -86,6 +86,37 @@ impl<B: Backend> CausalConv3d<B> {
         })
     }
 
+    /// Load convolution weights from a [`ltx_weights::Scope`].
+    ///
+    /// Reads `conv.weight` and, when bias is enabled, `conv.bias` relative to
+    /// `scope`.  Key names match the reference `CausalConv3d.state_dict()`.
+    ///
+    /// # Errors
+    /// Returns [`crate::VaeError::Load`] if any tensor is missing or has the
+    /// wrong rank, or [`crate::VaeError::Config`] if its shape does not match
+    /// the config-derived expectation.
+    pub(crate) fn load_weights_from_scope(
+        &mut self,
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<(), crate::error::VaeError> {
+        // Collect expected shapes first so there are no active borrows when
+        // we assign the replacement tensors.
+        let exp_w = self.conv.weight.lazy_shape().to_vec();
+        let exp_b: Option<Vec<usize>> = self.conv.bias.as_ref().map(|p| p.lazy_shape().to_vec());
+        self.conv.weight =
+            crate::load_util::load_param::<B, 5>(scope, "conv.weight", &exp_w, device)?;
+        if let Some(exp) = exp_b {
+            self.conv.bias = Some(crate::load_util::load_param::<B, 1>(
+                scope,
+                "conv.bias",
+                &exp,
+                device,
+            )?);
+        }
+        Ok(())
+    }
+
     /// Forward pass.
     ///
     /// When `causal` is `true` (the encoder always uses `true`), the input is

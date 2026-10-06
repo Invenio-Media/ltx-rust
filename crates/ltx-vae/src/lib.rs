@@ -30,6 +30,7 @@ pub mod config;
 pub mod conv;
 pub mod encoder;
 pub mod error;
+pub(crate) mod load_util;
 pub mod norm;
 pub mod patchify;
 pub mod resnet;

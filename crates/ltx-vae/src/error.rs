@@ -55,4 +55,8 @@ pub enum VaeError {
     /// A `serde_json` parse error.
     #[error("json parse error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// A weight-store error during checkpoint loading.
+    #[error("weight load error: {0}")]
+    Load(#[from] ltx_weights::WeightError),
 }

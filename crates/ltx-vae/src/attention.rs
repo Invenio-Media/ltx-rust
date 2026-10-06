@@ -50,6 +50,24 @@ impl<B: Backend> RmsNorm2d<B> {
         let gamma = self.gamma.clone().unsqueeze::<4>();
         normalised.mul(gamma)
     }
+
+    /// Load `gamma` from a [`ltx_weights::Scope`].
+    ///
+    /// Reads `gamma` (shape `[C, 1, 1]`) matching the reference
+    /// `_RMSNorm2D.state_dict()` key name.
+    ///
+    /// # Errors
+    /// Returns [`VaeError::Load`] if the tensor is missing or wrong rank, or
+    /// [`VaeError::Config`] if its shape does not match.
+    fn load_weights_from_scope(
+        &mut self,
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<(), VaeError> {
+        let exp = self.gamma.dims();
+        self.gamma = crate::load_util::load_tensor::<B, 3>(scope, "gamma", &exp, device)?;
+        Ok(())
+    }
 }
 
 // ── AttnBlock3D ───────────────────────────────────────────────────────────────
@@ -148,5 +166,53 @@ impl<B: Backend> AttnBlock3D<B> {
         let out5: Tensor<B, 5> = out4.reshape([nb, nt, nc, nh, nw]).swap_dims(1, 2);
 
         Ok(identity.add(out5))
+    }
+
+    /// Load all parameters from a [`ltx_weights::Scope`].
+    ///
+    /// Key names match the reference `AttnBlock3D.state_dict()`:
+    /// - `norm.gamma`
+    /// - `to_qkv.weight`, `to_qkv.bias`
+    /// - `proj.weight`, `proj.bias`
+    ///
+    /// # Errors
+    /// Returns [`VaeError::Load`] if any tensor is missing or wrong rank, or
+    /// [`VaeError::Config`] if a shape does not match.
+    pub(crate) fn load_weights_from_scope(
+        &mut self,
+        scope: &ltx_weights::Scope<'_>,
+        device: &B::Device,
+    ) -> Result<(), VaeError> {
+        // Collect expected shapes before mutable assignments.
+        let exp_qkv_w = self.to_qkv.weight.lazy_shape().to_vec();
+        let exp_qkv_b: Option<Vec<usize>> =
+            self.to_qkv.bias.as_ref().map(|p| p.lazy_shape().to_vec());
+        let exp_proj_w = self.proj.weight.lazy_shape().to_vec();
+        let exp_proj_b: Option<Vec<usize>> =
+            self.proj.bias.as_ref().map(|p| p.lazy_shape().to_vec());
+
+        self.norm
+            .load_weights_from_scope(&scope.scope("norm"), device)?;
+        self.to_qkv.weight =
+            crate::load_util::load_param::<B, 4>(scope, "to_qkv.weight", &exp_qkv_w, device)?;
+        if let Some(exp) = exp_qkv_b {
+            self.to_qkv.bias = Some(crate::load_util::load_param::<B, 1>(
+                scope,
+                "to_qkv.bias",
+                &exp,
+                device,
+            )?);
+        }
+        self.proj.weight =
+            crate::load_util::load_param::<B, 4>(scope, "proj.weight", &exp_proj_w, device)?;
+        if let Some(exp) = exp_proj_b {
+            self.proj.bias = Some(crate::load_util::load_param::<B, 1>(
+                scope,
+                "proj.bias",
+                &exp,
+                device,
+            )?);
+        }
+        Ok(())
     }
 }
