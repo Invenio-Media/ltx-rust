@@ -112,16 +112,18 @@ impl<B: Backend> VideoReferenceCondition<B> {
 
 /// Replace target latent tokens at a specific frame with a pre-encoded image.
 ///
-/// Mirrors the `VideoConditionByLatent` / `image_conditionings_by_replacing_latent`
-/// path used by `combined_image_conditionings` for seam keyframes.
+/// Mirrors `VideoConditionByLatentIndex` (`_apply_condition_by_latent_index` in
+/// `ltx_core.conditioning.types.latent_cond`), which `combined_image_conditionings`
+/// uses for an image at frame 0 — the seam keyframe.
 ///
-/// The frame's tokens are set to the encoded image latent in `clean_latent`;
-/// `denoise_mask` at those positions is set to `0` (fully frozen).
+/// The frame's tokens are written into `clean_latent`, and `denoise_mask` on
+/// those tokens is set to `1 − strength`. Tokens outside the frame are unchanged.
 ///
 /// # Fields
 /// - `image_latent`: encoded image `[B, C, 1, H, W]` (one frame).
 /// - `latent_frame_index`: which latent frame to replace (0-based).
 /// - `tokens_per_frame`: number of tokens one latent frame occupies (= H × W).
+/// - `strength`: `1.0` holds the frame clean, `0.0` leaves it fully denoised.
 pub struct ImageKeyframeCondition<B: Backend> {
     /// Encoded image latent `[B, C, 1, H, W]`.
     pub image_latent: Tensor<B, 5>,
@@ -129,6 +131,8 @@ pub struct ImageKeyframeCondition<B: Backend> {
     pub latent_frame_index: usize,
     /// Tokens per latent frame (= H × W).
     pub tokens_per_frame: usize,
+    /// Conditioning strength; the frame's denoise mask becomes `1 − strength`.
+    pub strength: f32,
 }
 
 impl<B: Backend> ImageKeyframeCondition<B> {
@@ -178,15 +182,16 @@ impl<B: Backend> ImageKeyframeCondition<B> {
         let after_zeros = Tensor::<B, 3>::zeros([batch, after, channels], device);
         let img_clean = Tensor::cat(vec![before_zeros, img_tokens, after_zeros], 1);
 
-        // Build a mask that is 0 only at the image frame.
+        // 1.0 on the image frame's tokens, 0.0 elsewhere.
         let before_1 = Tensor::<B, 3>::zeros([batch, start, 1], device);
-        let frozen_1 = Tensor::<B, 3>::zeros([batch, tpf, 1], device);
+        let frame_1 = Tensor::<B, 3>::ones([batch, tpf, 1], device);
         let after_1 = Tensor::<B, 3>::zeros([batch, after, 1], device);
-        let frame_mask = Tensor::cat(vec![before_1, frozen_1, after_1], 1);
-        let mask_inv = Tensor::ones_like(&frame_mask) - frame_mask.clone();
+        let frame_mask = Tensor::cat(vec![before_1, frame_1, after_1], 1);
+        let keep = Tensor::ones_like(&frame_mask) - frame_mask.clone();
 
-        state.clean_latent = state.clean_latent * mask_inv + img_clean * frame_mask.clone();
-        state.denoise_mask = state.denoise_mask * (Tensor::ones_like(&frame_mask) - frame_mask);
+        // clean_latent[span] = image tokens; denoise_mask[span] = 1 − strength.
+        state.clean_latent = state.clean_latent * keep.clone() + img_clean * frame_mask.clone();
+        state.denoise_mask = state.denoise_mask * keep + frame_mask * (1.0 - self.strength);
 
         Ok(state)
     }
@@ -244,5 +249,46 @@ mod tests {
             ref_mask.abs() < 1e-6,
             "reference mask should be 0, got {ref_mask}"
         );
+    }
+
+    #[test]
+    fn keyframe_condition_writes_only_its_frame() {
+        let device = dev();
+        // 3 latent frames x 2 tokens per frame, 2 channels.
+        let state = LatentState::<B> {
+            latent: Tensor::zeros([1, 6, 2], &device),
+            denoise_mask: Tensor::ones([1, 6, 1], &device),
+            positions: Tensor::zeros([1, 3, 6, 2], &device),
+            clean_latent: Tensor::full([1, 6, 2], -1.0, &device),
+            attention_mask: None,
+            keyframes_mask: None,
+        };
+        // Image latent [B=1, C=2, F=1, H=1, W=2]: tokens (1,2) and (3,4).
+        let image_latent =
+            Tensor::<B, 1>::from_floats([1.0, 3.0, 2.0, 4.0], &device).reshape([1, 2, 1, 1, 2]);
+        let cond = ImageKeyframeCondition {
+            image_latent,
+            latent_frame_index: 1,
+            tokens_per_frame: 2,
+            strength: 0.95,
+        };
+
+        let new_state = cond.apply_to(state, &device).unwrap();
+
+        let clean: Vec<f32> = new_state.clean_latent.into_data().to_vec().unwrap();
+        assert_eq!(
+            clean,
+            vec![
+                -1.0, -1.0, -1.0, -1.0, 1.0, 2.0, 3.0, 4.0, -1.0, -1.0, -1.0, -1.0
+            ]
+        );
+        let mask: Vec<f32> = new_state.denoise_mask.into_data().to_vec().unwrap();
+        let expected_mask = [1.0, 1.0, 0.05, 0.05, 1.0, 1.0];
+        for (got, want) in mask.iter().zip(expected_mask) {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "mask {mask:?} != {expected_mask:?}"
+            );
+        }
     }
 }
