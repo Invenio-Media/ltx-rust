@@ -13,8 +13,7 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::approx_constant,
-    clippy::doc_markdown
+    clippy::approx_constant
 )]
 
 use std::path::PathBuf;

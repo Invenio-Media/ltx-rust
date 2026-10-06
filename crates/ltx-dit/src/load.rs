@@ -32,13 +32,13 @@
 use burn::module::Param;
 use burn::nn::{Gelu, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
-use ltx_weights::Scope;
+use ltx_weights::{Scope, WeightError};
 
 use crate::{
     adaln::{AdaLayerNormSingle, TimestepEmbedding},
     attention::Attention,
     block::TransformerBlock,
-    config::{DiTConfig, RopeType},
+    config::DiTConfig,
     error::DitError,
     feed_forward::FeedForward,
     model::VideoTransformer,
@@ -56,16 +56,15 @@ impl<B: Backend> VideoTransformer<B> {
     /// # Errors
     ///
     /// - [`DitError::Config`] — invalid config (same as [`VideoTransformer::new`]).
-    /// - [`DitError::Weight`] — a required tensor is absent or has the wrong rank.
+    /// - [`DitError::Weight`] — a required tensor is absent, has the wrong
+    ///   rank, or has an unexpected shape.
     pub fn load(scope: &Scope, config: &DiTConfig, device: &B::Device) -> Result<Self, DitError> {
         config.validate()?;
 
         let patchify_proj = load_linear(scope, "patchify_proj", device)?;
         let adaln_single = load_adaln_single(scope, config, device)?;
 
-        let scale_shift_table: Tensor<B, 2> = scope
-            .tensor("scale_shift_table", device)
-            .map_err(DitError::Weight)?;
+        let scale_shift_table: Tensor<B, 2> = scope.tensor("scale_shift_table", device)?;
         let scale_shift_table = Param::from_tensor(scale_shift_table);
 
         let proj_out = load_linear(scope, "proj_out", device)?;
@@ -90,27 +89,51 @@ impl<B: Backend> VideoTransformer<B> {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+/// Validate that a 2-D weight tensor has `expected` shape.
+///
+/// Produces a [`WeightError::InvalidTensorData`] with the key and mismatch
+/// details if the shape does not match.  Called after transposing the loaded
+/// weight, so `expected[0] = in_features`, `expected[1] = out_features`.
+fn check_shape_2d<B: Backend>(
+    weight: &Tensor<B, 2>,
+    expected: [usize; 2],
+    key: &str,
+) -> Result<(), DitError> {
+    let got = weight.dims();
+    if got != expected {
+        return Err(DitError::Weight(WeightError::InvalidTensorData {
+            key: key.to_owned(),
+            message: format!(
+                "shape mismatch after transpose: expected [in={}, out={}], got [in={}, out={}]",
+                expected[0], expected[1], got[0], got[1]
+            ),
+        }));
+    }
+    Ok(())
+}
+
 /// Load a `Linear` module, transposing the weight from `PyTorch` `[out, in]` to
 /// Burn `[in, out]`.
 ///
 /// Bias is optional: if the key `{prefix}.bias` is absent the returned module
 /// has no bias.
+///
+/// Note: `LinearConfig::init` allocates random weights before they are
+/// overwritten by the checkpoint tensors.  On large models this doubles the
+/// per-layer peak memory transiently.  Burn does not currently expose a
+/// direct struct constructor that avoids this.
 fn load_linear<B: Backend>(
     scope: &Scope,
     prefix: &str,
     device: &B::Device,
 ) -> Result<Linear<B>, DitError> {
-    let w: Tensor<B, 2> = scope
-        .tensor(&format!("{prefix}.weight"), device)
-        .map_err(DitError::Weight)?;
+    let w: Tensor<B, 2> = scope.tensor(&format!("{prefix}.weight"), device)?;
     // PyTorch nn.Linear weight: [out_features, in_features].
     // Burn Linear weight: [in_features, out_features].  Transpose.
     let w = w.transpose();
     let [in_dim, out_dim] = w.dims();
 
-    let bias: Option<Tensor<B, 1>> = scope
-        .optional(&format!("{prefix}.bias"), device)
-        .map_err(DitError::Weight)?;
+    let bias: Option<Tensor<B, 1>> = scope.optional(&format!("{prefix}.bias"), device)?;
 
     let mut lin = LinearConfig::new(in_dim, out_dim)
         .with_bias(bias.is_some())
@@ -123,17 +146,13 @@ fn load_linear<B: Backend>(
 }
 
 /// Load a `RmsNorm` from `{prefix}.weight` into the `gamma` field.
-///
-/// `norm_eps` must match the config to keep the epsilon consistent.
 fn load_rms_norm<B: Backend>(
     scope: &Scope,
     prefix: &str,
     norm_eps: f64,
     device: &B::Device,
 ) -> Result<RmsNorm<B>, DitError> {
-    let gamma: Tensor<B, 1> = scope
-        .tensor(&format!("{prefix}.weight"), device)
-        .map_err(DitError::Weight)?;
+    let gamma: Tensor<B, 1> = scope.tensor(&format!("{prefix}.weight"), device)?;
     let [d_model] = gamma.dims();
     let mut norm = RmsNormConfig::new(d_model)
         .with_epsilon(norm_eps)
@@ -151,18 +170,29 @@ fn load_adaln_single<B: Backend>(
     let inner = config.inner_dim();
     let coeff = config.adaln_coeff();
 
-    // Reference path: `adaln_single.emb.timestep_embedder.{linear_1,linear_2}`
     let ts_scope = scope.scope("adaln_single.emb.timestep_embedder");
     let linear_1 = load_linear(&ts_scope, "linear_1", device)?;
     let linear_2 = load_linear(&ts_scope, "linear_2", device)?;
 
-    // Verify expected shapes after loading (sanity, not load failure).
-    debug_assert_eq!(linear_1.weight.dims(), [256, inner]);
-    debug_assert_eq!(linear_2.weight.dims(), [inner, inner]);
+    // Real validation for cross-checkpoint robustness.
+    check_shape_2d(
+        &linear_1.weight.val(),
+        [crate::adaln::SINUSOIDAL_HALF.saturating_mul(2), inner],
+        "adaln_single.emb.timestep_embedder.linear_1.weight",
+    )?;
+    check_shape_2d(
+        &linear_2.weight.val(),
+        [inner, inner],
+        "adaln_single.emb.timestep_embedder.linear_2.weight",
+    )?;
 
-    // `adaln_single.linear` — the output projection
-    let linear = load_linear(&scope.scope("adaln_single"), "linear", device)?;
-    debug_assert_eq!(linear.weight.dims(), [inner, inner.saturating_mul(coeff)]);
+    let adaln_scope = scope.scope("adaln_single");
+    let linear = load_linear(&adaln_scope, "linear", device)?;
+    check_shape_2d(
+        &linear.weight.val(),
+        [inner, inner.saturating_mul(coeff)],
+        "adaln_single.linear.weight",
+    )?;
 
     Ok(AdaLayerNormSingle {
         timestep_embedder: TimestepEmbedding { linear_1, linear_2 },
@@ -172,21 +202,18 @@ fn load_adaln_single<B: Backend>(
 
 /// Load an `Attention` module from `{block_scope}.{ref_prefix}.*`.
 ///
-/// `ref_prefix` is `"attn1"` for self-attention or `"attn2"` for cross-attention.
-#[allow(clippy::too_many_arguments)]
+/// `context_dim` is `None` for self-attention (`attn1`) and
+/// `Some(cross_attention_dim)` for cross-attention (`attn2`).
 fn load_attention<B: Backend>(
     block_scope: &Scope,
     ref_prefix: &str,
-    query_dim: usize,
     context_dim: Option<usize>,
-    heads: usize,
-    d_head: usize,
-    norm_eps: f64,
-    gated: bool,
-    rope_type: RopeType,
+    config: &DiTConfig,
     device: &B::Device,
 ) -> Result<Attention<B>, DitError> {
-    let inner = heads.saturating_mul(d_head);
+    let inner = config.inner_dim();
+    let ctx = context_dim.unwrap_or(inner);
+    let norm_eps = f64::from(config.norm_eps);
     let attn_scope = block_scope.scope(ref_prefix);
 
     let to_q = load_linear(&attn_scope, "to_q", device)?;
@@ -196,26 +223,47 @@ fn load_attention<B: Backend>(
     let q_norm = load_rms_norm(&attn_scope, "q_norm", norm_eps, device)?;
     let k_norm = load_rms_norm(&attn_scope, "k_norm", norm_eps, device)?;
 
-    // Reference uses `torch.nn.Sequential`; key is `to_out.0.{weight,bias}`.
+    // `to_out` is `torch.nn.Sequential`; checkpoint key is `to_out.0.*`.
     let to_out = load_linear(&attn_scope.scope("to_out"), "0", device)?;
 
-    let to_gate_logits = if gated {
+    let to_gate_logits = if config.flags.apply_gated_attention {
         Some(load_linear(&attn_scope, "to_gate_logits", device)?)
     } else {
         None
     };
 
-    // Sanity: verify shapes match expected dims (context_dim for k/v).
-    let ctx = context_dim.unwrap_or(query_dim);
-    debug_assert_eq!(to_q.weight.dims(), [query_dim, inner]);
-    debug_assert_eq!(to_k.weight.dims(), [ctx, inner]);
-    debug_assert_eq!(to_v.weight.dims(), [ctx, inner]);
-    debug_assert_eq!(to_out.weight.dims(), [inner, query_dim]);
+    // Validate shapes in release builds: a wrong config silently produces
+    // mismatched matmul shapes inside `forward`, which is hard to diagnose.
+    check_shape_2d(
+        &to_q.weight.val(),
+        [inner, inner],
+        &format!("{ref_prefix}.to_q.weight"),
+    )?;
+    check_shape_2d(
+        &to_k.weight.val(),
+        [ctx, inner],
+        &format!("{ref_prefix}.to_k.weight"),
+    )?;
+    check_shape_2d(
+        &to_v.weight.val(),
+        [ctx, inner],
+        &format!("{ref_prefix}.to_v.weight"),
+    )?;
+    check_shape_2d(
+        &to_out.weight.val(),
+        [inner, inner],
+        &format!("{ref_prefix}.to_out.0.weight"),
+    )?;
 
+    let d_head = config.attention_head_dim;
+    // `d_head` is validated as even by `DiTConfig::validate()` and ≤ 256 in
+    // all supported configs.  The f32 mantissa is 23 bits so values ≤ 2^23
+    // are exact.  Using `f32::from` on a `u8` is not safe here because
+    // `d_head` can be larger than 255.
     #[expect(
         clippy::as_conversions,
         clippy::cast_precision_loss,
-        reason = "d_head ≤ 128 in all supported configs; lossless f32 conversion"
+        reason = "d_head ≤ 256 in all supported configs; lossless f32 conversion"
     )]
     let attn_scale = 1.0_f32 / (d_head as f32).sqrt();
 
@@ -227,10 +275,10 @@ fn load_attention<B: Backend>(
         k_norm,
         to_out,
         to_gate_logits,
-        heads,
+        heads: config.num_attention_heads,
         d_head,
         attn_scale,
-        rope_type,
+        rope_type: config.rope_type,
         q_chunk: None,
     })
 }
@@ -260,47 +308,22 @@ fn load_block<B: Backend>(
     config: &DiTConfig,
     device: &B::Device,
 ) -> Result<TransformerBlock<B>, DitError> {
-    let inner = config.inner_dim();
-    let norm_eps = f64::from(config.norm_eps);
-    let gated = config.flags.apply_gated_attention;
-
-    let attn_self = load_attention(
-        block_scope,
-        "attn1",
-        inner,
-        None,
-        config.num_attention_heads,
-        config.attention_head_dim,
-        norm_eps,
-        gated,
-        config.rope_type,
-        device,
-    )?;
-
+    let attn_self = load_attention(block_scope, "attn1", None, config, device)?;
     let attn_cross = load_attention(
         block_scope,
         "attn2",
-        inner,
         Some(config.cross_attention_dim),
-        config.num_attention_heads,
-        config.attention_head_dim,
-        norm_eps,
-        gated,
-        config.rope_type,
+        config,
         device,
     )?;
 
     let ff = load_feed_forward(block_scope, device)?;
 
-    let scale_shift_table: Tensor<B, 2> = block_scope
-        .tensor("scale_shift_table", device)
-        .map_err(DitError::Weight)?;
+    let scale_shift_table: Tensor<B, 2> = block_scope.tensor("scale_shift_table", device)?;
     let scale_shift_table = Param::from_tensor(scale_shift_table);
 
     let prompt_scale_shift_table = if config.flags.cross_attention_adaln {
-        let t: Tensor<B, 2> = block_scope
-            .tensor("prompt_scale_shift_table", device)
-            .map_err(DitError::Weight)?;
+        let t: Tensor<B, 2> = block_scope.tensor("prompt_scale_shift_table", device)?;
         Some(Param::from_tensor(t))
     } else {
         None

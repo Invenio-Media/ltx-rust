@@ -16,8 +16,8 @@ use burn::prelude::*;
 use burn::tensor::DType;
 use burn::tensor::activation::silu;
 
-// Half-dim for the sinusoidal embedding (256 channels total).
-const SINUSOIDAL_HALF: usize = 128;
+/// Half-dimension of the sinusoidal timestep embedding (total = 2×).
+pub(crate) const SINUSOIDAL_HALF: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Sinusoidal timestep embedding (no learnable parameters)

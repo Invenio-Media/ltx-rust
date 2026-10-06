@@ -23,6 +23,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 burn = { workspace = true, features = ["ndarray", "std"] }
-ltx-weights = { path = "../ltx-weights" }
+
 [lints]
 workspace = true
